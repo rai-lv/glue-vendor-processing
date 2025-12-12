@@ -1522,25 +1522,64 @@ def main():
                 "continuing unsorted"
             )
 
-        # New reference key
-        new_ref_key = f"canonical_mappings/Category_Mapping_Reference_{ts}.json"
+        # Pre-write validation: fail fast if Category_Mapping_Reference would be empty
+        record_count = len(new_reference_list)
+        log_info(
+            logger,
+            f"Category_Mapping_Reference record_count={record_count}",
+        )
+        print(f"DEBUG: STEP E – Category_Mapping_Reference record_count={record_count}")
+        
+        if record_count == 0:
+            log_error(
+                logger,
+                "Aborting: Category_Mapping_Reference would be empty (record_count=0). Failing fast.",
+            )
+            print("DEBUG: STEP E – Category_Mapping_Reference is empty; aborting job")
+            raise RuntimeError(
+                "Category_Mapping_Reference empty after processing - aborting job"
+            )
+
+        # Prepare S3 keys: canonical (stable name for backwards compat) and archival (timestamped)
+        # IMPORTANT: Canonical filenames must remain stable for downstream consumer compatibility.
+        canonical_mappings_prefix = "canonical_mappings"
+        reference_canonical_key = f"{canonical_mappings_prefix}/Category_Mapping_Reference.json"
+        reference_archive_key = f"{canonical_mappings_prefix}/Category_Mapping_Reference_{ts}.json"
 
         # Write new reference file
         current_step = "STEP E: Write new Category_Mapping_Reference"
         log_info(logger, current_step)
         body_ref = json.dumps(new_reference_list, indent=2, ensure_ascii=False)
+        
+        # Write canonical file (stable filename for downstream consumers)
         log_info(
             logger,
-            f"STEP E: Writing new Category_Mapping_Reference to "
-            f"s3://{input_bucket}/{new_ref_key}",
+            f"STEP E: Writing canonical Category_Mapping_Reference to "
+            f"s3://{input_bucket}/{reference_canonical_key}",
         )
         print(
-            "DEBUG: STEP E – writing new Category_Mapping_Reference to: "
-            f"s3://{input_bucket}/{new_ref_key}"
+            "DEBUG: STEP E – writing canonical Category_Mapping_Reference to: "
+            f"s3://{input_bucket}/{reference_canonical_key}"
         )
         s3_client.put_object(
             Bucket=input_bucket,
-            Key=new_ref_key,
+            Key=reference_canonical_key,
+            Body=body_ref.encode("utf-8"),
+        )
+        
+        # Write archival copy (timestamped for historical tracking)
+        log_info(
+            logger,
+            f"STEP E: Writing archival Category_Mapping_Reference to "
+            f"s3://{input_bucket}/{reference_archive_key}",
+        )
+        print(
+            "DEBUG: STEP E – writing archival Category_Mapping_Reference to: "
+            f"s3://{input_bucket}/{reference_archive_key}"
+        )
+        s3_client.put_object(
+            Bucket=input_bucket,
+            Key=reference_archive_key,
             Body=body_ref.encode("utf-8"),
         )
 
@@ -1572,27 +1611,47 @@ def main():
             "vendor_name": vendor_name,
             "timestamp": ts,
             "old_reference_key": latest_ref_key,
-            "new_reference_key": new_ref_key,
+            "new_reference_key": reference_canonical_key,
             "changes": changes,
         }
 
-        change_key = (
-            "canonical_mappings/"
+        # Prepare changelog S3 keys: canonical (stable) and archival (timestamped)
+        # IMPORTANT: Canonical changelog filename must remain stable for downstream consumer compatibility.
+        changelog_canonical_key = f"{canonical_mappings_prefix}/Category_Mapping_Reference_changelog.json"
+        changelog_archive_key = (
+            f"{canonical_mappings_prefix}/"
             f"Category_Mapping_RuleChanges_{vendor_name}_{ts}.json"
         )
 
         body_change = json.dumps(change_log, indent=2, ensure_ascii=False)
+        
+        # Write canonical changelog (stable filename for downstream consumers)
         log_info(
             logger,
-            f"STEP E: Writing rule change log to s3://{input_bucket}/{change_key}",
+            f"STEP E: Writing canonical rule change log to s3://{input_bucket}/{changelog_canonical_key}",
         )
         print(
-            "DEBUG: STEP E – writing rule change log to: "
-            f"s3://{input_bucket}/{change_key}"
+            "DEBUG: STEP E – writing canonical rule change log to: "
+            f"s3://{input_bucket}/{changelog_canonical_key}"
         )
         s3_client.put_object(
             Bucket=input_bucket,
-            Key=change_key,
+            Key=changelog_canonical_key,
+            Body=body_change.encode("utf-8"),
+        )
+        
+        # Write archival changelog (timestamped for historical tracking)
+        log_info(
+            logger,
+            f"STEP E: Writing archival rule change log to s3://{input_bucket}/{changelog_archive_key}",
+        )
+        print(
+            "DEBUG: STEP E – writing archival rule change log to: "
+            f"s3://{input_bucket}/{changelog_archive_key}"
+        )
+        s3_client.put_object(
+            Bucket=input_bucket,
+            Key=changelog_archive_key,
             Body=body_change.encode("utf-8"),
         )
 
