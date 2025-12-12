@@ -38,6 +38,7 @@
 import sys
 import json
 import traceback
+import os
 from datetime import datetime, timezone
 
 import boto3
@@ -1522,8 +1523,38 @@ def main():
                 "continuing unsorted"
             )
 
-        # New reference key
-        new_ref_key = f"canonical_mappings/Category_Mapping_Reference_{ts}.json"
+        # Compute record count robustly
+        canonical_mappings_prefix = "canonical_mappings"
+        timestamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+        
+        # Determine record count based on object type
+        try:
+            # Check if it's a Spark DataFrame
+            if hasattr(new_reference_list, 'count') and callable(getattr(new_reference_list, 'count')):
+                record_count = new_reference_list.count()
+            # Check if it's a pandas DataFrame
+            elif hasattr(new_reference_list, 'iloc'):
+                record_count = len(new_reference_list)
+            # Check if it's a list
+            elif isinstance(new_reference_list, list):
+                record_count = len(new_reference_list)
+            # Otherwise try len()
+            else:
+                try:
+                    record_count = len(new_reference_list)
+                except (TypeError, AttributeError):
+                    record_count = 1
+        except Exception:
+            record_count = 1
+        
+        log_info(logger, f"Category_Mapping_Reference record_count={record_count}")
+        
+        if record_count == 0:
+            log_error(logger, "Category_Mapping_Reference has 0 records; cannot write empty reference file")
+            raise RuntimeError("Category_Mapping_Reference has 0 records")
+        
+        # New reference key (timestamped only, no stable version)
+        new_ref_key = os.path.join(canonical_mappings_prefix, f"Category_Mapping_Reference_{timestamp}.json")
 
         # Write new reference file
         current_step = "STEP E: Write new Category_Mapping_Reference"
@@ -1570,7 +1601,7 @@ def main():
 
         change_log = {
             "vendor_name": vendor_name,
-            "timestamp": ts,
+            "timestamp": timestamp,
             "old_reference_key": latest_ref_key,
             "new_reference_key": new_ref_key,
             "changes": changes,
@@ -1578,7 +1609,7 @@ def main():
 
         change_key = (
             "canonical_mappings/"
-            f"Category_Mapping_RuleChanges_{vendor_name}_{ts}.json"
+            f"Category_Mapping_RuleChanges_{vendor_name}_{timestamp}.json"
         )
 
         body_change = json.dumps(change_log, indent=2, ensure_ascii=False)
@@ -1595,6 +1626,85 @@ def main():
             Key=change_key,
             Body=body_change.encode("utf-8"),
         )
+
+        # =========================================================
+        # STEP E: Write Category_Mapping_StableTrainingDataset.json if not exists
+        # =========================================================
+        current_step = "STEP E: Write Category_Mapping_StableTrainingDataset.json if not exists"
+        stable_training_dataset_key = os.path.join(
+            canonical_mappings_prefix,
+            "Category_Mapping_StableTrainingDataset.json"
+        )
+        
+        # Check if the stable training dataset already exists
+        stable_dataset_exists = False
+        try:
+            s3_client.head_object(Bucket=input_bucket, Key=stable_training_dataset_key)
+            stable_dataset_exists = True
+            log_info(
+                logger,
+                f"Stable training dataset already exists at s3://{input_bucket}/{stable_training_dataset_key}"
+            )
+            print(
+                f"DEBUG: STEP E – stable training dataset already exists at: "
+                f"s3://{input_bucket}/{stable_training_dataset_key}"
+            )
+        except ClientError as ce:
+            # If the error is 404 (Not Found), the object doesn't exist
+            error_code = ce.response.get('Error', {}).get('Code', '')
+            if error_code in ('404', 'NoSuchKey'):
+                stable_dataset_exists = False
+                log_info(
+                    logger,
+                    f"Stable training dataset does not exist at s3://{input_bucket}/{stable_training_dataset_key}; will create it"
+                )
+                print(
+                    f"DEBUG: STEP E – stable training dataset does not exist; will create it"
+                )
+            else:
+                # Other errors should be logged but not fail the job
+                log_warning(
+                    logger,
+                    f"Error checking existence of stable training dataset: {repr(ce)}"
+                )
+                print(
+                    f"DEBUG: STEP E – error checking stable dataset existence: {repr(ce)}"
+                )
+        except Exception as e_head:
+            # Other exceptions should be logged but not fail the job
+            log_warning(
+                logger,
+                f"Unexpected error checking existence of stable training dataset: {repr(e_head)}"
+            )
+            print(
+                f"DEBUG: STEP E – unexpected error checking stable dataset existence: {repr(e_head)}"
+            )
+        
+        # Write the stable training dataset if it doesn't exist
+        if not stable_dataset_exists:
+            try:
+                stable_dataset_body = json.dumps(final_records, indent=2, ensure_ascii=False)
+                s3_client.put_object(
+                    Bucket=input_bucket,
+                    Key=stable_training_dataset_key,
+                    Body=stable_dataset_body.encode("utf-8"),
+                )
+                log_info(
+                    logger,
+                    f"STEP E: Stable training dataset written to s3://{input_bucket}/{stable_training_dataset_key}"
+                )
+                print(
+                    f"DEBUG: STEP E – stable training dataset written to: "
+                    f"s3://{input_bucket}/{stable_training_dataset_key}"
+                )
+            except Exception as e_write:
+                log_warning(
+                    logger,
+                    f"Error writing stable training dataset: {repr(e_write)}"
+                )
+                print(
+                    f"DEBUG: STEP E – error writing stable training dataset: {repr(e_write)}"
+                )
 
         log_info(logger, "========== JOB END (SUCCESS) ==========")
         print("DEBUG: JOB END – success path reached")
