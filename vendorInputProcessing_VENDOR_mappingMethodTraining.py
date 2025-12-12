@@ -1251,6 +1251,231 @@ def main():
             }
             rule_proposals.append(rule_obj)
 
+        # =========================================================
+        # K2 Mapping Method: Generate exclude-based rules
+        # =========================================================
+        current_step = "STEP K2: Generate K2 exclude-based keyword rules"
+        log_info(logger, current_step)
+        print("DEBUG: STEP K2 – starting K2 rule generation")
+
+        # Step 1: Build training_kw_occurrences (case-insensitive)
+        training_kw_occurrences = {}
+        for rec in training_records:
+            pim_category_id_raw = rec.get("pim_category_id")
+            # Normalize pim_category_id to string for consistent comparisons
+            pim_category_id = str(pim_category_id_raw) if pim_category_id_raw is not None else None
+            raw_keywords = rec.get("keywords") or []
+            if not isinstance(raw_keywords, list):
+                continue
+            # Build lowercased set of keywords for this record
+            keywords_set_lower = set()
+            for kw in raw_keywords:
+                if kw is None:
+                    continue
+                kw_lower = str(kw).strip().lower()
+                if kw_lower:
+                    keywords_set_lower.add(kw_lower)
+            
+            if not keywords_set_lower:
+                continue
+            
+            # Add to occurrence index for each keyword
+            for kw_lower in keywords_set_lower:
+                if kw_lower not in training_kw_occurrences:
+                    training_kw_occurrences[kw_lower] = []
+                training_kw_occurrences[kw_lower].append({
+                    "pim_category_id": pim_category_id,
+                    "keywords_set_lower": keywords_set_lower
+                })
+
+        # Step 2: Build vendor_kw_occurrences from match_data (case-insensitive)
+        vendor_kw_occurrences = {}
+        for vcat_key, vcat_record in match_data.items():
+            if not isinstance(vcat_record, dict):
+                continue
+            pim_matches = vcat_record.get("pim_matches") or []
+            if not isinstance(pim_matches, list):
+                continue
+
+            for m in pim_matches:
+                if not isinstance(m, dict):
+                    continue
+                pim_category_id_raw = m.get("pim_category_id")
+                # Normalize pim_category_id to string for consistent comparisons
+                pim_category_id = str(pim_category_id_raw) if pim_category_id_raw is not None else None
+                products = m.get("products") or []
+                if not isinstance(products, list):
+                    continue
+
+                for p in products:
+                    if not isinstance(p, dict):
+                        continue
+                    raw_keywords = p.get("keywords")
+                    if raw_keywords is None:
+                        kws = []
+                    elif isinstance(raw_keywords, list):
+                        kws = raw_keywords
+                    else:
+                        kws = [raw_keywords]
+
+                    # Build lowercased set of keywords for this product
+                    keywords_set_lower = set()
+                    for kw in kws:
+                        if kw is None:
+                            continue
+                        kw_lower = str(kw).strip().lower()
+                        if kw_lower:
+                            keywords_set_lower.add(kw_lower)
+                    
+                    if not keywords_set_lower:
+                        continue
+                    
+                    # Add to occurrence index for each keyword
+                    for kw_lower in keywords_set_lower:
+                        if kw_lower not in vendor_kw_occurrences:
+                            vendor_kw_occurrences[kw_lower] = []
+                        vendor_kw_occurrences[kw_lower].append({
+                            "pim_category_id": pim_category_id,
+                            "keywords_set_lower": keywords_set_lower
+                        })
+
+        # Step 3: Select K2 candidate rows from df_stats
+        k2_candidates = df_stats.where(
+            (F.col("inside_count") >= F.lit(MIN_KEYWORD_INSIDE_SUPPORT))
+            & (F.col("hard_outside_count") > F.lit(MAX_KEYWORD_HARD_OUTSIDE))
+        ).collect()
+
+        log_info(logger, f"STEP K2: Found {len(k2_candidates)} K2 candidate rows")
+        print(f"DEBUG: STEP K2 – found {len(k2_candidates)} K2 candidates")
+
+        # Step 4: Process each K2 candidate
+        k2_rules_count = 0
+        for r in k2_candidates:
+            try:
+                pim_category_id = r["pim_category_id"]
+                pim_category_id_norm = (
+                    str(pim_category_id) if pim_category_id is not None else None
+                )
+                keyword = r["keyword"]
+                keyword_lower = keyword.strip().lower()
+
+                # Get occurrences for this keyword
+                occ_list = training_kw_occurrences.get(keyword_lower, [])
+                if not occ_list:
+                    continue
+
+                # Partition into inside and outside sets
+                inside_sets = []
+                outside_sets = []
+                for occ in occ_list:
+                    occ_pim_category_id_norm = (
+                        str(occ["pim_category_id"]) if occ["pim_category_id"] is not None else None
+                    )
+                    if occ_pim_category_id_norm == pim_category_id_norm:
+                        inside_sets.append(occ["keywords_set_lower"])
+                    else:
+                        outside_sets.append(occ["keywords_set_lower"])
+
+                # Compute inside_tokens and outside_tokens
+                inside_tokens = set()
+                for s in inside_sets:
+                    inside_tokens.update(s)
+                
+                outside_tokens = set()
+                for s in outside_sets:
+                    outside_tokens.update(s)
+
+                # Compute exclude_candidates
+                exclude_candidates = outside_tokens - inside_tokens
+                if not exclude_candidates:
+                    continue
+
+                # Validate coverage: all outside sets must intersect exclude_candidates
+                coverage_ok = True
+                for s in outside_sets:
+                    if not (s & exclude_candidates):
+                        coverage_ok = False
+                        break
+                
+                if not coverage_ok:
+                    continue
+
+                # Compute vendor stats under K2 semantics
+                vendor_occ_list = vendor_kw_occurrences.get(keyword_lower, [])
+                vendor_total_k2 = 0
+                vendor_inside_k2 = 0
+                vendor_outside_k2 = 0
+
+                for vocc in vendor_occ_list:
+                    # If keyword set intersects exclude_candidates, exclude this occurrence
+                    if vocc["keywords_set_lower"] & exclude_candidates:
+                        continue
+                    
+                    # Count this occurrence
+                    vendor_total_k2 += 1
+                    vocc_pim_category_id_norm = (
+                        str(vocc["pim_category_id"]) if vocc["pim_category_id"] is not None else None
+                    )
+                    if vocc_pim_category_id_norm == pim_category_id_norm:
+                        vendor_inside_k2 += 1
+                    else:
+                        vendor_outside_k2 += 1
+
+                # Decide vendor_status_k2
+                if vendor_total_k2 == 0:
+                    vendor_status_k2 = "not_impacted"
+                elif vendor_inside_k2 >= MIN_VENDOR_INSIDE_SUPPORT and vendor_outside_k2 <= MAX_VENDOR_OUTSIDE_SUPPORT:
+                    # Check if this is a known rule from previous training
+                    known_in_previous = r["known_in_previous_training"] if r["known_in_previous_training"] is not None else False
+                    vendor_status_k2 = "new" if not known_in_previous else "supported"
+                else:
+                    # Vendor violates K2 semantics, skip this candidate
+                    continue
+
+                # Build K2 rule object
+                pim_category_id_str = str(pim_category_id) if pim_category_id is not None else None
+                pim_category_name = category_name_map.get(pim_category_id_str)
+                inside_count = int(r["inside_count"]) if r["inside_count"] is not None else 0
+
+                k2_rule_obj = {
+                    "pim_category_id": pim_category_id,
+                    "pim_category_name": pim_category_name,
+                    "field_name": "KEYWORD",
+                    "operator": "contains_any_exclude_any",
+                    "values_include": [keyword.strip()],
+                    "values_exclude": sorted(list(exclude_candidates)),
+                    "stats": {
+                        "inside_count": inside_count,
+                        "train_total_count": inside_count,
+                        "hard_outside_count": 0,
+                        "vendor_inside_count": vendor_inside_k2,
+                        "vendor_total_count": vendor_total_k2,
+                        "vendor_outside_count": vendor_outside_k2,
+                        "vendor_status": vendor_status_k2,
+                    },
+                }
+                rule_proposals.append(k2_rule_obj)
+                k2_rules_count += 1
+
+                # Log accepted K2 rule
+                log_info(
+                    logger,
+                    f"STEP K2: Accepted K2 rule - category={pim_category_id}, "
+                    f"keyword={keyword}, exclude_count={len(exclude_candidates)}, "
+                    f"vendor_status={vendor_status_k2}"
+                )
+
+            except Exception as e_k2:
+                log_warning(
+                    logger,
+                    f"STEP K2: Failed to process K2 candidate "
+                    f"(category={r.get('pim_category_id')}, keyword={r.get('keyword')}): {repr(e_k2)}"
+                )
+                continue
+
+        log_info(logger, f"STEP K2: Appended {k2_rules_count} K2 rules to rule_proposals")
+        print(f"DEBUG: STEP K2 – appended {k2_rules_count} K2 rules")
+
         log_info(
             logger,
             f"STEP D5: Generated {len(rule_proposals)} rule-status entries "
