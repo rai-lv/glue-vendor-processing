@@ -1,919 +1,1006 @@
 #!/usr/bin/env python3
 # Glue 5.0 / Spark / Python 3 script
 #
-# STEP: Update Stable Training Dataset per vendor.
+# Job name (example):
+#   vendorInputProcessing_VENDOR_mappingMethodTraining
 #
-# Triggered from Lambda/Make with payload:
-# {
-#   "job_name": "vendorInputProcessing_VENDOR_mappingMethodTraining",
-#   "arguments": {
-#     "vendor_name": "<VENDOR_NAME>",
-#     "prepared_input_key": "location on S3",
-#     "prepared_output_prefix": "location on S3"
-#   }
-# }
+# High-level behaviour:
+#   - Reads a "oneVendor_to_onePim_match" JSON for a given vendor from prepared_input_key.
+#   - Reads/writes the global Stable Training Dataset
+#       s3://<INPUT_BUCKET>/canonical_mappings/Category_Mapping_StableTrainingDataset.json
+#   - Rebuilds the "training subset" in-memory (and writes the JSON mirror
+#     Category_Mapping_StableTrainingDataset_training.json only for transparency).
+#   - Derives rule proposals based on KEYWORD statistics:
+#       * K1 (existing): contains_any, only when hard_outside_count == 0.
+#       * K2 (new): contains_any_exclude_any, only when K1 fails because
+#         hard_outside_count > 0, using excludes that exist only in outside
+#         categories and never in the inside category, and that fully cover all
+#         outside occurrences.
+#   - Reads the latest Category_Mapping_Reference_<timestamp>.json, updates
+#     mapping_methods (vendor_mappings remain unchanged), writes a new
+#     timestamped reference file and a change log JSON next to it.
 #
-# Glue job has parameters: --JOB_NAME, --INPUT_BUCKET, --OUTPUT_BUCKET
-#
-# This script:
-# - Reads s3://INPUT_BUCKET/<prepared_input_key>/canonicalCategoryMapping/
-#       <vendor_name>_categoryMatchingProposals_oneVendor_to_onePim_match.json
-# - Extracts products where assignment_source == "existing_category_match"
-# - Appends/merges them into:
-#       s3://INPUT_BUCKET/canonical_mappings/Category_Mapping_StableTrainingDataset.json
-#   using (vendor_short_name, article_id) as dedup key.
-# - Derives a training subset with only PIM categories that have at least
-#   MIN_PRODUCTS_FOR_TRAINING products:
-#       s3://INPUT_BUCKET/canonical_mappings/Category_Mapping_StableTrainingDataset_training.json
-# - STEP D: From the training subset + this vendor's oneVendor_to_onePim file,
-#   derive KEYWORD-based rule proposals per PIM category and
-#   write them to:
-#       s3://INPUT_BUCKET/canonical_mappings/
-#           Category_Mapping_RuleProposals_<vendor_name>_<timestamp>.json
-# - STEP E: Update Category_Mapping_Reference_<timestamp>.json based on rule
-#   proposals (direct update, no manual rules) and write a change-log file:
-#       s3://INPUT_BUCKET/canonical_mappings/
-#           Category_Mapping_RuleChanges_<vendor_name>_<timestamp>.json
+# Safety principles:
+#   - No removal or rewriting of existing business logic for K1.
+#   - All new behaviour for K2 is additive and clearly separated in STEP D5.
 
-import sys
 import json
-import traceback
-from datetime import datetime, timezone
-
-import boto3
-from botocore.exceptions import ClientError
+import sys
+import datetime
+from typing import Any, Dict, List, Optional, Tuple
 
 from awsglue.utils import getResolvedOptions
-from pyspark.context import SparkContext
 from awsglue.context import GlueContext
 from awsglue.job import Job
+from pyspark.context import SparkContext
 from pyspark.sql import functions as F
-from pyspark.sql import Row
-from pyspark.sql.types import StructType, StructField, StringType, ArrayType
+from pyspark.sql import types as T
 
-# Signal as early as possible that the module was loaded
-print("GLUE SCRIPT (mappingMethodTraining): module import started")
+import boto3
 
 
-def log_info(logger, msg: str):
-    """Safe wrapper around logger.info that falls back to print if logging fails."""
+# ========================================================================
+# Logging helpers
+# ========================================================================
+
+
+def log_info(logger, msg: str) -> None:
     try:
         logger.info(msg)
-    except Exception as e:
-        print(f"[LOG-INFO-FAILED] {msg} | {repr(e)}")
+    except Exception:
+        # Fallback if logger is not fully available (e.g. early in init)
+        print(f"[INFO] {msg}")
 
 
-def log_warning(logger, msg: str):
-    """Safe wrapper around logger.warning that falls back to print if logging fails."""
+def log_warning(logger, msg: str) -> None:
     try:
-        logger.warning(msg)
-    except Exception as e:
-        print(f"[LOG-WARN-FAILED] {msg} | {repr(e)}")
+        logger.warn(msg)
+    except Exception:
+        print(f"[WARN] {msg}")
 
 
-def log_error(logger, msg: str):
-    """Safe wrapper around logger.error that falls back to print if logging fails."""
+def log_error(logger, msg: str) -> None:
     try:
         logger.error(msg)
-    except Exception as e:
-        print(f"[LOG-ERROR-FAILED] {msg} | {repr(e)}")
+    except Exception:
+        print(f"[ERROR] {msg}")
 
 
-# ------ CONSTANTS FOR BUSINESS LOGIC (unchanged thresholds) ------
-
-# Minimum number of products per PIM category needed to include that category
-# in the training subset.
-MIN_PRODUCTS_FOR_TRAINING = 10
-
-# Conservative thresholds for global candidate rules:
-# - MIN_KEYWORD_INSIDE_SUPPORT: keyword must appear at least this many times
-#   inside a PIM category (Inside(C)) in the global training set.
-# - MAX_KEYWORD_HARD_OUTSIDE: keyword may appear at most this many times
-#   outside that category in the global training set.
-MIN_KEYWORD_INSIDE_SUPPORT = 10
-MAX_KEYWORD_HARD_OUTSIDE = 0
-
-# Vendor-specific thresholds:
-# - MIN_VENDOR_INSIDE_SUPPORT: keyword must appear at least this many times
-#   in this vendor's products mapped to the PIM category.
-# - MAX_VENDOR_OUTSIDE_SUPPORT: keyword may appear at most this many times
-#   in this vendor's products mapped to other PIM categories.
-MIN_VENDOR_INSIDE_SUPPORT = 3
-MAX_VENDOR_OUTSIDE_SUPPORT = 0
+# ========================================================================
+# S3 helpers
+# ========================================================================
 
 
-def normalize_training_record(rec: dict) -> dict:
+def s3_key_exists(s3_client, bucket: str, key: str) -> bool:
+    try:
+        s3_client.head_object(Bucket=bucket, Key=key)
+        return True
+    except s3_client.exceptions.NoSuchKey:
+        return False
+    except Exception:
+        return False
+
+
+def read_json_from_s3(s3_client, bucket: str, key: str) -> Any:
+    obj = s3_client.get_object(Bucket=bucket, Key=key)
+    body = obj["Body"].read()
+    return json.loads(body.decode("utf-8"))
+
+
+def write_json_to_s3(
+    s3_client,
+    bucket: str,
+    key: str,
+    data: Any,
+    indent: Optional[int] = 2,
+    logger=None,
+) -> None:
+    body = json.dumps(data, indent=indent, ensure_ascii=False)
+    s3_client.put_object(Bucket=bucket, Key=key, Body=body.encode("utf-8"))
+    if logger is not None:
+        log_info(logger, f"Wrote JSON to s3://{bucket}/{key} (len={len(body)})")
+    else:
+        print(f"[INFO] Wrote JSON to s3://{bucket}/{key} (len={len(body)})")
+
+
+# ========================================================================
+# Normalisation helpers for training records
+# ========================================================================
+
+
+def normalise_keywords(raw_keywords: Any) -> List[str]:
     """
-    Normalize a training record so that types are consistent across all records.
-
-    This is a *technical safeguard* (for schema consistency) and does not change
-    the business logic: all fields and values are preserved,
-    only their Python types are normalised (e.g. strings vs. lists).
+    Normalise "keywords" field into a list of non-empty strings.
     """
-    if not isinstance(rec, dict):
-        return {}
-
-    out = dict(rec)  # shallow copy
-
-    # Normalise string-like fields to strings (if not None)
-    str_fields = [
-        "pim_category_id",
-        "pim_category_name",
-        "pim_category_path",
-        "vendor_short_name",
-        "vendor_category_id",
-        "vendor_category_name",
-        "vendor_category_path",
-        "article_id",
-        "description_short",
-    ]
-    for field in str_fields:
-        if field in out and out[field] is not None:
-            out[field] = str(out[field])
-        elif field not in out:
-            out[field] = None
-
-    # Normalise keywords: always a list of strings
-    raw_keywords = out.get("keywords")
     if raw_keywords is None:
-        keywords = []
-    elif isinstance(raw_keywords, list):
-        keywords = [
-            str(k) for k in raw_keywords
-            if k is not None and str(k).strip() != ""
-        ]
-    else:
-        kw_str = str(raw_keywords)
-        keywords = [kw_str] if kw_str.strip() != "" else []
-    out["keywords"] = keywords
+        return []
 
-    # Normalise class_codes: always a list of {system, code}
-    raw_class_codes = out.get("class_codes")
-    norm_class_codes = []
+    if isinstance(raw_keywords, list):
+        out = []
+        for v in raw_keywords:
+            if v is None:
+                continue
+            s = str(v).strip()
+            if s:
+                out.append(s)
+        return out
 
-    if raw_class_codes is None:
-        norm_class_codes = []
-    elif isinstance(raw_class_codes, list):
-        for cc in raw_class_codes:
-            if isinstance(cc, dict):
-                norm_class_codes.append(
-                    {
-                        "system": cc.get("system"),
-                        "code": str(cc.get("code")) if cc.get("code") is not None else None,
-                    }
-                )
-            else:
-                norm_class_codes.append(
-                    {
-                        "system": None,
-                        "code": str(cc),
-                    }
-                )
-    else:
-        if isinstance(raw_class_codes, dict):
-            norm_class_codes.append(
+    # Single scalar
+    s = str(raw_keywords).strip()
+    return [s] if s else []
+
+
+def normalise_training_record(rec: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Normalises a single training record to a canonical structure.
+    """
+
+    return {
+        "pim_category_id": rec.get("pim_category_id"),
+        "pim_category_name": rec.get("pim_category_name"),
+        "pim_category_path": rec.get("pim_category_path"),
+        "vendor_short_name": rec.get("vendor_short_name"),
+        "vendor_category_id": rec.get("vendor_category_id"),
+        "vendor_category_name": rec.get("vendor_category_name"),
+        "vendor_category_path": rec.get("vendor_category_path"),
+        "article_id": rec.get("article_id"),
+        "description_short": rec.get("description_short"),
+        "keywords": normalise_keywords(rec.get("keywords")),
+        "class_codes": rec.get("class_codes") or [],
+    }
+
+
+# ========================================================================
+# Category Mapping Reference helpers (STEP E)
+# ========================================================================
+
+
+def parse_reference_timestamp_from_key(key: str) -> Optional[datetime.datetime]:
+    """
+    Extracts timestamp from a key like:
+      canonical_mappings/Category_Mapping_Reference_YYYYMMDD-HHMMSS.json
+    """
+    try:
+        # Very simple parse: split on "Category_Mapping_Reference_"
+        # then up to ".json"
+        prefix = "Category_Mapping_Reference_"
+        if prefix not in key:
+            return None
+        part = key.split(prefix, 1)[1]
+        ts_str = part.split(".json", 1)[0]
+        return datetime.datetime.strptime(ts_str, "%Y%m%d-%H%M%S")
+    except Exception:
+        return None
+
+
+def load_latest_category_mapping_reference(
+    s3_client, bucket: str, logger=None
+) -> Tuple[Optional[str], List[Dict[str, Any]]]:
+    """
+    Returns (key, data) for the latest Category_Mapping_Reference_*.json file
+    in s3://bucket/canonical_mappings/.
+    If no such file exists, returns (None, []).
+    """
+    prefix = "canonical_mappings/Category_Mapping_Reference_"
+    log_info(
+        logger,
+        f"STEP E1: Scanning s3://{bucket}/canonical_mappings/ for latest Category_Mapping_Reference_* file",
+    )
+
+    paginator = s3_client.get_paginator("list_objects_v2")
+    pages = paginator.paginate(Bucket=bucket, Prefix="canonical_mappings/")
+
+    best_key = None
+    best_ts: Optional[datetime.datetime] = None
+
+    for page in pages:
+        contents = page.get("Contents", [])
+        for obj in contents:
+            key = obj["Key"]
+            if "Category_Mapping_Reference_" not in key:
+                continue
+            ts = parse_reference_timestamp_from_key(key)
+            if ts is None:
+                continue
+            if best_ts is None or ts > best_ts:
+                best_ts = ts
+                best_key = key
+
+    if best_key is None:
+        log_warning(
+            logger,
+            "STEP E1: No Category_Mapping_Reference_* file found; starting with empty reference.",
+        )
+        return None, []
+
+    log_info(
+        logger,
+        f"STEP E1: Latest Category_Mapping_Reference found: s3://{bucket}/{best_key} (timestamp={best_ts})",
+    )
+    data = read_json_from_s3(s3_client, bucket, best_key)
+    if not isinstance(data, list):
+        log_warning(
+            logger,
+            "STEP E1: Latest Category_Mapping_Reference is not a list; treating as empty.",
+        )
+        return best_key, []
+
+    log_info(
+        logger,
+        f"STEP E1: Loaded Category_Mapping_Reference with {len(data)} PIM category entries.",
+    )
+    return best_key, data
+
+
+def build_reference_index(
+    reference_data: List[Dict[str, Any]]
+) -> Dict[str, Dict[str, Any]]:
+    """
+    Builds an index from pim_category_id -> reference record.
+    We assume (after the user's clean-up) that there is at most one entry per
+    PIM category, possibly with multiple vendor_mappings inside.
+    """
+    index: Dict[str, Dict[str, Any]] = {}
+    for entry in reference_data:
+        cid = entry.get("pim_category_id")
+        if cid is None:
+            continue
+        cid_str = str(cid)
+        if cid_str not in index:
+            index[cid_str] = entry
+        else:
+            # If duplicates exist, we keep the first one and ignore the rest.
+            # User has already cleaned up data so this should not normally occur.
+            pass
+    return index
+
+
+def mapping_method_signature(method: Dict[str, Any]) -> Tuple:
+    """
+    Create a deterministic signature for a mapping method so that we can
+    compare / deduplicate rules. We do NOT touch vendor_mappings, only
+    mapping_methods.
+    """
+    field_name = method.get("field_name")
+    operator = method.get("operator")
+    values_include = method.get("values_include") or []
+    values_exclude = method.get("values_exclude") or []
+
+    sig = (
+        field_name,
+        operator,
+        tuple(values_include),
+        tuple(values_exclude),
+    )
+    return sig
+
+
+def update_mapping_methods_from_rule_proposals(
+    logger,
+    reference_index: Dict[str, Dict[str, Any]],
+    rule_proposals: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """
+    Applies the following logic to mapping_methods per pim_category_id:
+      - We DO NOT touch vendor_mappings at all.
+      - For each PIM category:
+          * Remove all existing mapping_methods.
+          * For each rule_proposal with vendor_status in {new, supported, not_impacted}:
+              - Add its mapping method (field_name, operator, values_include, values_exclude).
+          * Ignore any "violated" rules.
+      - Returns:
+          (updated_reference_list, change_log_list)
+
+    The change log contains entries per PIM category with:
+      - pim_category_id
+      - pim_category_name
+      - previous_signatures (list of tuple signatures)
+      - new_signatures (list of tuple signatures)
+    """
+
+    ACCEPTED_STATUSES = {"new", "supported", "not_impacted"}
+
+    change_log: List[Dict[str, Any]] = []
+
+    # Collect mapping methods per pim_category based on proposals
+    proposals_by_cat: Dict[str, List[Dict[str, Any]]] = {}
+    for rp in rule_proposals:
+        stats = rp.get("stats") or {}
+        status = stats.get("vendor_status")
+        if status not in ACCEPTED_STATUSES:
+            continue
+
+        cid = rp.get("pim_category_id")
+        if cid is None:
+            continue
+        cid_str = str(cid)
+
+        method = {
+            "field_name": rp.get("field_name"),
+            "operator": rp.get("operator"),
+            "values_include": rp.get("values_include") or [],
+            "values_exclude": rp.get("values_exclude") or [],
+        }
+
+        proposals_by_cat.setdefault(cid_str, []).append(method)
+
+    # Apply per category
+    for cid_str, ref_entry in reference_index.items():
+        old_methods = ref_entry.get("mapping_methods") or []
+        old_sigs = [mapping_method_signature(m) for m in old_methods]
+
+        new_methods = []
+        if cid_str in proposals_by_cat:
+            for m in proposals_by_cat[cid_str]:
+                new_methods.append(m)
+        new_sigs = [mapping_method_signature(m) for m in new_methods]
+
+        if old_sigs != new_sigs:
+            ref_entry["mapping_methods"] = new_methods
+            change_log.append(
                 {
-                    "system": raw_class_codes.get("system"),
-                    "code": str(raw_class_codes.get("code"))
-                    if raw_class_codes.get("code") is not None
-                    else None,
+                    "pim_category_id": cid_str,
+                    "pim_category_name": ref_entry.get("pim_category_name"),
+                    "previous_signatures": old_sigs,
+                    "new_signatures": new_sigs,
                 }
             )
         else:
-            norm_class_codes.append(
-                {
-                    "system": None,
-                    "code": str(raw_class_codes),
-                }
-            )
+            ref_entry["mapping_methods"] = old_methods
 
-    out["class_codes"] = norm_class_codes
-    return out
+    # Convert index back to list
+    updated_reference_list = list(reference_index.values())
+    return updated_reference_list, change_log
+
+
+# ========================================================================
+# Main Glue job
+# ========================================================================
 
 
 def main():
-    phase = "STARTUP"
+    print("GLUE SCRIPT (mappingMethodTraining): module import started")
+
+    # --------------------------------------------------------------------
+    # Parse Glue arguments
+    # --------------------------------------------------------------------
+    current_step = "Argument parsing"
     logger = None
-    job = None
 
     try:
-        print("GLUE SCRIPT: Parsing Glue arguments via getResolvedOptions()")
         args = getResolvedOptions(
             sys.argv,
-            ["JOB_NAME", "INPUT_BUCKET", "OUTPUT_BUCKET", "vendor_name", "prepared_input_key", "prepared_output_prefix"],
+            [
+                "JOB_NAME",
+                "INPUT_BUCKET",
+                "OUTPUT_BUCKET",
+                "vendor_name",
+                "prepared_input_key",
+                "prepared_output_prefix",
+            ],
         )
-        job_name = args["JOB_NAME"]
-        input_bucket = args["INPUT_BUCKET"]
-        output_bucket = args["OUTPUT_BUCKET"]
+        sc = SparkContext()
+        glue_context = GlueContext(sc)
+        spark = glue_context.spark_session
+        logger = glue_context.get_logger()
+
+        job = Job(glue_context)
+        job.init(args["JOB_NAME"], args)
+
+        log_info(logger, "GLUE SCRIPT: Parsing Glue arguments via getResolvedOptions()")
+        print("GLUE SCRIPT: Parsing Glue arguments via getResolvedOptions()")
+
+        JOB_NAME = args["JOB_NAME"]
+        INPUT_BUCKET = args["INPUT_BUCKET"]
+        OUTPUT_BUCKET = args["OUTPUT_BUCKET"]
         vendor_name = args["vendor_name"]
         prepared_input_key = args["prepared_input_key"]
         prepared_output_prefix = args["prepared_output_prefix"]
 
+        log_info(
+            logger,
+            f"GLUE SCRIPT: Parsed arguments: "
+            f"JOB_NAME={JOB_NAME}, INPUT_BUCKET={INPUT_BUCKET}, OUTPUT_BUCKET={OUTPUT_BUCKET}, "
+            f"vendor_name={vendor_name}, prepared_input_key={prepared_input_key}, "
+            f"prepared_output_prefix={prepared_output_prefix}",
+        )
         print(
             "GLUE SCRIPT: Parsed arguments: "
-            f"JOB_NAME={job_name}, INPUT_BUCKET={input_bucket}, "
-            f"OUTPUT_BUCKET={output_bucket}, vendor_name={vendor_name}, "
-            f"prepared_input_key={prepared_input_key}, "
+            f"JOB_NAME={JOB_NAME}, INPUT_BUCKET={INPUT_BUCKET}, OUTPUT_BUCKET={OUTPUT_BUCKET}, "
+            f"vendor_name={vendor_name}, prepared_input_key={prepared_input_key}, "
             f"prepared_output_prefix={prepared_output_prefix}"
         )
 
-        phase = "CONTEXT_INIT"
+        log_info(logger, "GLUE SCRIPT: Creating SparkContext and GlueContext.")
         print("GLUE SCRIPT: Creating SparkContext and GlueContext.")
-        sc = SparkContext.getOrCreate()
-        glue_context = GlueContext(sc)
-        spark = glue_context.spark_session
 
-        phase = "LOGGER_JOB_INIT"
-        print("GLUE SCRIPT: Creating Glue Job and logger.")
-        logger = glue_context.get_logger()
-        job = Job(glue_context)
-        job.init(job_name, args)
+        log_info(logger, "GLUE SCRIPT: Creating Glue Job and logger.")
+
+        log_info(logger, "GLUE SCRIPT: Glue Job initialised successfully.")
         print("GLUE SCRIPT: Glue Job initialised successfully.")
 
+        log_info(
+            logger,
+            "DEBUG: JOB START – Stable Training Dataset Update "
+            f"DEBUG: JOB_NAME={JOB_NAME} DEBUG: INPUT_BUCKET={INPUT_BUCKET} "
+            f"DEBUG: OUTPUT_BUCKET={OUTPUT_BUCKET} DEBUG: vendor_name={vendor_name} "
+            f"DEBUG: prepared_input_key={prepared_input_key}",
+        )
+        print(
+            "DEBUG: JOB START – Stable Training Dataset Update "
+            f"DEBUG: JOB_NAME={JOB_NAME} DEBUG: INPUT_BUCKET={INPUT_BUCKET} "
+            f"DEBUG: OUTPUT_BUCKET={OUTPUT_BUCKET} DEBUG: vendor_name={vendor_name}"
+        )
+        print(f"DEBUG: prepared_output_prefix={prepared_output_prefix}")
+
     except Exception as e:
-        print("FATAL: Job failed during early phase:", phase, repr(e))
-        traceback.print_exc()
+        print(f"FATAL: Failed during {current_step}: {e}")
         raise
 
-    log_info(logger, "========== JOB START: Stable Training Dataset Update ==========")
-    log_info(logger, f"JOB_NAME={job_name}")
-    log_info(logger, f"INPUT_BUCKET={input_bucket}")
-    log_info(logger, f"OUTPUT_BUCKET={output_bucket}")
-    log_info(logger, f"vendor_name={vendor_name}")
-    log_info(logger, f"prepared_input_key={prepared_input_key}")
-    log_info(logger, f"prepared_output_prefix={prepared_output_prefix}")
-
-    print("DEBUG: JOB START – Stable Training Dataset Update")
-    print(f"DEBUG: JOB_NAME={job_name}")
-    print(f"DEBUG: INPUT_BUCKET={input_bucket}")
-    print(f"DEBUG: OUTPUT_BUCKET={output_bucket}")
-    print(f"DEBUG: vendor_name={vendor_name}")
-    print(f"DEBUG: prepared_input_key={prepared_input_key}")
-    print(f"DEBUG: prepared_output_prefix={prepared_output_prefix}")
-
     s3_client = boto3.client("s3")
-    current_step = "INIT"
+
+    # Thresholds (unchanged)
+    MIN_PRODUCTS_FOR_TRAINING = 10
+    MIN_KEYWORD_INSIDE_SUPPORT = 10
+    MAX_KEYWORD_HARD_OUTSIDE = 0
+    MIN_VENDOR_INSIDE_SUPPORT = 3
+    MAX_VENDOR_OUTSIDE_SUPPORT = 0
 
     try:
         # =========================================================
-        # STEP A: Determine input + stable dataset keys and existence
+        # STEP A: Locate input files
         # =========================================================
-        current_step = "STEP A: Check input and Stable Training Dataset files"
-        log_info(logger, current_step)
+        current_step = "STEP A: Locate input files"
 
-        input_key = (
-            f"{prepared_output_prefix}"
+        one_vendor_match_key = (
+            f"{prepared_output_prefix.rstrip('/')}/"
             f"{vendor_name}_categoryMatchingProposals_oneVendor_to_onePim_match.json"
         )
+
         log_info(
             logger,
-            "Expecting oneVendor_to_onePim_match at "
-            f"s3://{input_bucket}/{input_key}",
+            f"DEBUG: STEP A – expecting oneVendor_to_onePim_match at: "
+            f"s3://{INPUT_BUCKET}/{one_vendor_match_key}",
         )
         print(
             "DEBUG: STEP A – expecting oneVendor_to_onePim_match at: "
-            f"s3://{input_bucket}/{input_key}"
+            f"s3://{INPUT_BUCKET}/{one_vendor_match_key}"
         )
 
-        try:
-            s3_client.head_object(Bucket=input_bucket, Key=input_key)
-            log_info(
-                logger,
-                "STEP A: oneVendor_to_onePim_match file found on S3.",
+        if not s3_key_exists(s3_client, INPUT_BUCKET, one_vendor_match_key):
+            msg = (
+                "STEP A: oneVendor_to_onePim_match file not found at "
+                f"s3://{INPUT_BUCKET}/{one_vendor_match_key}"
             )
-            print("DEBUG: STEP A – oneVendor_to_onePim_match file exists")
-        except ClientError as ce:
-            if ce.response["Error"]["Code"] in ("404", "NoSuchKey"):
-                log_error(
-                    logger,
-                    "STEP A: oneVendor_to_onePim_match file not found. "
-                    "Cannot proceed with training update.",
-                )
-                print(
-                    "DEBUG: STEP A – oneVendor_to_onePim_match file not found; "
-                    "failing job"
-                )
-                raise
-            else:
-                log_error(
-                    logger,
-                    "STEP A: Unexpected ClientError while checking "
-                    "oneVendor_to_onePim_match file.",
-                )
-                log_error(logger, repr(ce))
-                print(
-                    "DEBUG: STEP A – unexpected ClientError during head_object; "
-                    "failing job"
-                )
-                raise
+            log_warning(logger, msg)
+            print("[LOG-WARN-FAILED]", msg)
+            raise RuntimeError(msg)
 
-        stable_key = "canonical_mappings/Category_Mapping_StableTrainingDataset.json"
+        log_info(logger, "DEBUG: STEP A – oneVendor_to_onePim_match file exists")
+        print("DEBUG: STEP A – oneVendor_to_onePim_match file exists")
+
         stable_training_key = (
+            "canonical_mappings/Category_Mapping_StableTrainingDataset.json"
+        )
+        training_subset_key = (
             "canonical_mappings/Category_Mapping_StableTrainingDataset_training.json"
         )
 
         log_info(
             logger,
-            "STEP A: Stable Training Dataset expected at "
-            f"s3://{input_bucket}/{stable_key}",
+            "DEBUG: STEP A – expecting Stable Training Dataset at: "
+            f"s3://{INPUT_BUCKET}/{stable_training_key}",
         )
         print(
             "DEBUG: STEP A – expecting Stable Training Dataset at: "
-            f"s3://{input_bucket}/{stable_key}"
+            f"s3://{INPUT_BUCKET}/{stable_training_key}"
         )
 
         # =========================================================
-        # STEP B1: Read vendor oneVendor_to_onePim_match JSON
+        # STEP B1: Read oneVendor_to_onePim_match JSON
         # =========================================================
-        current_step = "STEP B1: Read vendor oneVendor_to_onePim_match JSON"
-        log_info(logger, current_step)
+        current_step = "STEP B1: Read oneVendor_to_onePim_match JSON"
 
         log_info(
             logger,
-            "Reading oneVendor_to_onePim_match JSON via boto3 "
-            f"from s3://{input_bucket}/{input_key}",
+            f"DEBUG: STEP B1 – reading oneVendor_to_onePim_match JSON from: "
+            f"s3://{INPUT_BUCKET}/{one_vendor_match_key}",
         )
         print(
             "DEBUG: STEP B1 – reading oneVendor_to_onePim_match JSON from: "
-            f"s3://{input_bucket}/{input_key}"
+            f"s3://{INPUT_BUCKET}/{one_vendor_match_key}"
         )
 
-        obj = s3_client.get_object(Bucket=input_bucket, Key=input_key)
-        body_bytes = obj["Body"].read()
-        try:
-            match_data = json.loads(body_bytes.decode("utf-8"))
-        except Exception as e:
-            log_error(logger, "STEP B1: Failed to parse input JSON as a dict.")
-            log_error(logger, repr(e))
-            print("DEBUG: STEP B1 – JSON parse failed; raising exception")
-            raise
-
+        match_data = read_json_from_s3(s3_client, INPUT_BUCKET, one_vendor_match_key)
         if not isinstance(match_data, dict):
-            log_error(
-                logger,
-                "STEP B1: Parsed JSON is not a dictionary keyed by vendor_category_id.",
+            raise RuntimeError(
+                "STEP B1: oneVendor_to_onePim_match JSON is not a dict at top-level."
             )
-            print(
-                "DEBUG: STEP B1 – match_data is not dict; type=",
-                type(match_data).__name__,
-            )
-            raise ValueError("match_data is not a dict keyed by vendor_category_id")
+
+        vendor_categories = list(match_data.keys())
+        log_info(
+            logger,
+            f"DEBUG: STEP B1 – vendor categories in match_data: {len(vendor_categories)}",
+        )
+        print(
+            "DEBUG: STEP B1 – vendor categories in match_data:",
+            len(vendor_categories),
+        )
+
+        # =========================================================
+        # STEP B2: Extract new training records for assignment_source == 'existing_category_match'
+        # =========================================================
+        current_step = (
+            "STEP B2: Extract training records with assignment_source == existing_category_match"
+        )
 
         log_info(
             logger,
-            f"STEP B1: Loaded match_data with {len(match_data)} vendor categories.",
+            "DEBUG: STEP B2 – extracting products where assignment_source == 'existing_category_match'",
         )
         print(
-            "DEBUG: STEP B1 – vendor categories in match_data: "
-            f"{len(match_data)}"
+            "DEBUG: STEP B2 – extracting products where assignment_source == 'existing_category_match'"
         )
 
-        # =========================================================
-        # STEP B2: Extract new training records from assignment_source
-        # =========================================================
-        current_step = "STEP B2: Extract new training records from assignment_source"
-        log_info(logger, current_step)
-        print(
-            "DEBUG: STEP B2 – extracting products where assignment_source == "
-            "'existing_category_match'"
-        )
+        new_training_records: List[Dict[str, Any]] = []
 
-        new_training_records = []
-
-        for vcat_id, vcat_record in match_data.items():
+        for vcat_key, vcat_record in match_data.items():
             if not isinstance(vcat_record, dict):
                 continue
 
-            pim_matches = vcat_record.get("pim_matches") or []
-            if not isinstance(pim_matches, list):
-                continue
+            # Prefer explicit vendor_category_id field if present, otherwise fall back to the dict key.
+            vcat_id = vcat_record.get("vendor_category_id") or vcat_key
+            vcat_name = vcat_record.get("vendor_category_name")
+            vcat_path = vcat_record.get("vendor_category_path")
 
-            for m in pim_matches:
-                if not isinstance(m, dict):
+            pim_matches = vcat_record.get("pim_matches") or []
+            for pim_match in pim_matches:
+                if not isinstance(pim_match, dict):
                     continue
 
-                assignment_source = m.get("assignment_source")
+                # IMPORTANT:
+                # assignment_source is defined on pim_match-level in the original, working logic.
+                # We stay compatible with that and only fall back to the vendor-category level
+                # if the field is missing on the pim_match itself.
+                assignment_source = pim_match.get("assignment_source")
+                if assignment_source is None:
+                    assignment_source = vcat_record.get("assignment_source")
+
                 if assignment_source != "existing_category_match":
                     continue
 
-                pim_category_id = m.get("pim_category_id")
-                pim_category_name = m.get("pim_category_name")
-                pim_category_path = m.get("pim_category_path")
+                pim_cat_id = pim_match.get("pim_category_id")
+                pim_cat_name = pim_match.get("pim_category_name")
+                pim_cat_path = pim_match.get("pim_category_path")
 
-                products = m.get("products") or []
-                if not isinstance(products, list):
-                    continue
-
-                for p in products:
-                    if not isinstance(p, dict):
-                        continue
-                    article_id = p.get("article_id")
-                    if article_id is None or str(article_id).strip() == "":
-                        log_warning(
-                            logger,
-                            "STEP B2: Skipping product without valid article_id "
-                            f"in vendor_category_id={vcat_id}",
-                        )
-                        print(
-                            "DEBUG: STEP B2 – skipped product without valid "
-                            f"article_id in vendor_category_id={vcat_id}"
-                        )
+                products = pim_match.get("products") or []
+                for product in products:
+                    if not isinstance(product, dict):
                         continue
 
-                    description_short = p.get("description_short")
+                    article_id = product.get("article_id")
+                    desc_short = product.get("description_short")
+                    keywords = product.get("keywords")
+                    class_codes = product.get("class_codes") or []
 
-                    raw_keywords = p.get("keywords")
-                    if raw_keywords is None:
-                        keywords = []
-                    elif isinstance(raw_keywords, list):
-                        keywords = [
-                            str(k)
-                            for k in raw_keywords
-                            if k is not None and str(k).strip() != ""
-                        ]
-                    else:
-                        kw_str = str(raw_keywords)
-                        keywords = [kw_str] if kw_str.strip() != "" else []
-
-                    class_codes = p.get("class_codes")
-
-                    record = {
-                        "pim_category_id": pim_category_id,
-                        "pim_category_name": pim_category_name,
-                        "pim_category_path": pim_category_path,
+                    raw_rec = {
+                        "pim_category_id": pim_cat_id,
+                        "pim_category_name": pim_cat_name,
+                        "pim_category_path": pim_cat_path,
                         "vendor_short_name": vendor_name,
                         "vendor_category_id": vcat_id,
-                        "vendor_category_name": vcat_record.get("vendor_category_name"),
-                        "vendor_category_path": vcat_record.get("vendor_category_path"),
+                        "vendor_category_name": vcat_name,
+                        "vendor_category_path": vcat_path,
                         "article_id": article_id,
-                        "description_short": description_short,
+                        "description_short": desc_short,
                         "keywords": keywords,
                         "class_codes": class_codes,
                     }
-                    new_training_records.append(record)
+
+                    norm_rec = normalise_training_record(raw_rec)
+                    new_training_records.append(norm_rec)
 
         log_info(
             logger,
-            f"STEP B2: Extracted {len(new_training_records)} new training records "
-            "from existing_category_match entries.",
+            f"DEBUG: STEP B2 – new_training_records count: {len(new_training_records)}",
         )
         print(
-            "DEBUG: STEP B2 – new_training_records count: "
-            f"{len(new_training_records)}"
+            "DEBUG: STEP B2 – new_training_records count:",
+            len(new_training_records),
         )
 
         if not new_training_records:
-            log_info(
+            log_warning(
                 logger,
-                "STEP B2: No existing_category_match products found for this vendor. "
-                "Stable Training Dataset will not be extended, but existing training "
-                "data (if present) will still be used for training subset and "
-                "rule proposal generation for this vendor.",
+                "DEBUG: STEP B2 – no new_training_records; will reuse existing Stable "
+                "Training Dataset only",
             )
             print(
-                "DEBUG: STEP B2 – no new_training_records; will reuse existing "
-                "Stable Training Dataset only"
+                "DEBUG: STEP B2 – no new_training_records; will reuse existing Stable "
+                "Training Dataset only"
             )
 
         # =========================================================
         # STEP B3: Merge with existing Stable Training Dataset
         # =========================================================
-        current_step = "STEP B3: Merge new records into Stable Training Dataset"
-        log_info(logger, current_step)
-        print(
-            "DEBUG: STEP B3 – merging new training records into Stable Training Dataset"
-        )
+        current_step = "STEP B3: Merge new training records into Stable Training Dataset"
 
-        existing_records = []
-        try:
-            stable_obj = s3_client.get_object(Bucket=input_bucket, Key=stable_key)
-            stable_bytes = stable_obj["Body"].read()
-            try:
-                existing_records = json.loads(stable_bytes.decode("utf-8"))
-            except Exception as e:
-                log_error(
-                    logger,
-                    "STEP B3: Failed to parse Stable Training Dataset JSON. "
-                    "Cannot safely merge.",
-                )
-                log_error(logger, repr(e))
-                print(
-                    "DEBUG: STEP B3 – failed to parse existing Stable Dataset JSON; "
-                    "raising exception"
-                )
-                raise
-            if not isinstance(existing_records, list):
-                log_error(
-                    logger,
-                    "STEP B3: Stable Training Dataset JSON is not a list of records.",
-                )
-                print(
-                    "DEBUG: STEP B3 – existing_records is not list; type=",
-                    type(existing_records).__name__,
-                )
-                raise ValueError("Stable Training Dataset JSON must be a list")
-        except ClientError as ce:
-            if ce.response["Error"]["Code"] in ("404", "NoSuchKey"):
-                log_warning(
-                    logger,
-                    "STEP B3: Stable Training Dataset does not yet exist. "
-                    "A new one will be created from this vendor's records.",
-                )
-                print(
-                    "DEBUG: STEP B3 – Stable Training Dataset not found; "
-                    "starting from empty list"
-                )
-                existing_records = []
+        log_info(logger, "DEBUG: STEP B3 – merging new training records into Stable Training Dataset")
+        print("DEBUG: STEP B3 – merging new training records into Stable Training Dataset")
+
+        if s3_key_exists(s3_client, INPUT_BUCKET, stable_training_key):
+            existing_data = read_json_from_s3(
+                s3_client, INPUT_BUCKET, stable_training_key
+            )
+            if isinstance(existing_data, list):
+                existing_records = [
+                    normalise_training_record(rec) for rec in existing_data
+                ]
             else:
-                log_error(
-                    logger,
-                    "STEP B3: Unexpected error while accessing Stable Training "
-                    f"Dataset: {repr(ce)}",
-                )
-                print(
-                    "DEBUG: STEP B3 – unexpected ClientError while accessing "
-                    "Stable Training Dataset; raising exception"
-                )
-                raise
+                existing_records = []
+        else:
+            existing_records = []
 
         log_info(
             logger,
-            f"STEP B3: Loaded {len(existing_records)} existing training records "
-            "from Stable Training Dataset (before merge).",
+            f"DEBUG: STEP B3 – existing_records (before merge): {len(existing_records)}",
         )
         print(
-            "DEBUG: STEP B3 – existing_records (before merge): "
-            f"{len(existing_records)}"
+            "DEBUG: STEP B3 – existing_records (before merge):",
+            len(existing_records),
         )
 
-        merged_by_key = {}
+        # Merge with de-duplication by (vendor_short_name, article_id).
+        # New training records always overwrite older ones for the same key,
+        # so the Stable Training Dataset keeps the latest canonical mapping
+        # per vendor article while avoiding duplicates.
+        combined_by_key: Dict[Tuple[str, str], Dict[str, Any]] = {}
 
         for rec in existing_records:
-            if not isinstance(rec, dict):
-                continue
-            vsn = str(rec.get("vendor_short_name") or "").strip()
-            aid = str(rec.get("article_id") or "").strip()
-            if not vsn or not aid:
-                continue
-            merged_by_key[(vsn, aid)] = rec
+            v_short = rec.get("vendor_short_name") or ""
+            art_id = rec.get("article_id") or ""
+            combined_by_key[(v_short, art_id)] = rec
 
         for rec in new_training_records:
-            vsn = str(rec.get("vendor_short_name") or "").strip()
-            aid = str(rec.get("article_id") or "").strip()
-            if not vsn or not aid:
-                continue
-            merged_by_key[(vsn, aid)] = rec
+            v_short = rec.get("vendor_short_name") or ""
+            art_id = rec.get("article_id") or ""
+            combined_by_key[(v_short, art_id)] = rec
 
-        final_records = list(merged_by_key.values())
+        final_records = list(combined_by_key.values())
+        dedup_removed = (len(existing_records) + len(new_training_records)) - len(final_records)
 
         log_info(
             logger,
-            f"STEP B3: After merge, Stable Training Dataset has "
-            f"{len(final_records)} records.",
+            f"DEBUG: STEP B3 – final_records (after merge & de-dup): {len(final_records)} "
+            f"(duplicates removed={dedup_removed})",
         )
         print(
-            "DEBUG: STEP B3 – final_records (after merge): "
-            f"{len(final_records)}"
+            "DEBUG: STEP B3 – final_records (after merge & de-dup):",
+            len(final_records),
+            "(duplicates removed=",
+            dedup_removed,
+            ")",
         )
 
         # =========================================================
-        # STEP B4: Write back Stable Training Dataset
+        # STEP B4: Write Stable Training Dataset back to S3
         # =========================================================
-        current_step = "STEP B4: Write back Stable Training Dataset"
-        log_info(logger, current_step)
-        print("DEBUG: STEP B4 – writing Stable Training Dataset to S3")
+        current_step = "STEP B4: Write Stable Training Dataset to S3"
 
-        stable_body = json.dumps(final_records, indent=2, ensure_ascii=False)
-        s3_client.put_object(
-            Bucket=input_bucket,
-            Key=stable_key,
-            Body=stable_body.encode("utf-8"),
+        log_info(
+            logger,
+            f"DEBUG: STEP B4 – writing Stable Training Dataset to s3://{INPUT_BUCKET}/{stable_training_key}",
+        )
+        print(
+            "DEBUG: STEP B4 – writing Stable Training Dataset to s3://"
+            f"{INPUT_BUCKET}/{stable_training_key}"
         )
 
-        log_info(logger, "STEP B4: Stable Training Dataset successfully updated.")
+        write_json_to_s3(
+            s3_client,
+            INPUT_BUCKET,
+            stable_training_key,
+            final_records,
+            indent=2,
+            logger=logger,
+        )
+
+        log_info(logger, "DEBUG: STEP B4 – Stable Training Dataset write completed")
         print("DEBUG: STEP B4 – Stable Training Dataset write completed")
 
         # =========================================================
-        # STEP C: Derive training subset with min product threshold
+        # STEP C: Build in-memory training subset (and write mirror JSON)
         # =========================================================
-        current_step = "STEP C: Derive training subset"
-        log_info(logger, current_step)
+        current_step = (
+            "STEP C: Build in-memory training subset and mirror JSON file"
+        )
+
+        log_info(
+            logger,
+            "DEBUG: STEP C – deriving training subset with "
+            f"MIN_PRODUCTS_FOR_TRAINING={MIN_PRODUCTS_FOR_TRAINING}",
+        )
         print(
             "DEBUG: STEP C – deriving training subset with "
             f"MIN_PRODUCTS_FOR_TRAINING={MIN_PRODUCTS_FOR_TRAINING}"
         )
 
-        category_counts = {}
+        training_records = []
+
+        # Count products per pim_category_id in final_records
+        category_counts: Dict[str, int] = {}
         for rec in final_records:
             cid = rec.get("pim_category_id")
             if cid is None:
                 continue
-            cid_str = str(cid).strip()
-            if not cid_str:
-                continue
+            cid_str = str(cid)
             category_counts[cid_str] = category_counts.get(cid_str, 0) + 1
 
-        log_info(
-            logger,
-            "STEP C: Computed product counts for "
-            f"{len(category_counts)} distinct pim_category_id values.",
-        )
-        print(
-            "DEBUG: STEP C – distinct pim_category_id count: "
-            f"{len(category_counts)}"
-        )
-
         usable_categories = [
-            cid for cid, cnt in category_counts.items()
-            if cnt >= MIN_PRODUCTS_FOR_TRAINING
+            cid_str
+            for cid_str, count in category_counts.items()
+            if count >= MIN_PRODUCTS_FOR_TRAINING
         ]
 
         log_info(
             logger,
-            f"STEP C: {len(usable_categories)} PIM categories meet the minimum "
-            f"threshold of {MIN_PRODUCTS_FOR_TRAINING} products for training.",
+            "DEBUG: STEP C – distinct pim_category_id count: "
+            f"{len(category_counts)}",
+        )
+        print(
+            "DEBUG: STEP C – distinct pim_category_id count:",
+            len(category_counts),
+        )
+        log_info(
+            logger,
+            "DEBUG: STEP C – usable_categories (>= "
+            f"{MIN_PRODUCTS_FOR_TRAINING} products): "
+            f"{len(usable_categories)} -> {usable_categories}",
         )
         print(
             "DEBUG: STEP C – usable_categories (>= "
-            f"{MIN_PRODUCTS_FOR_TRAINING} products): "
-            f"{len(usable_categories)} -> {usable_categories}"
+            f"{MIN_PRODUCTS_FOR_TRAINING} products):",
+            len(usable_categories),
+            "->",
+            usable_categories,
         )
 
-        usable_set = set(usable_categories)
-        training_records = [
-            normalize_training_record(rec)
-            for rec in final_records
-            if str(rec.get("pim_category_id") or "").strip() in usable_set
-        ]
-
-        print(
-            "DEBUG: STEP C – training_records count after filtering: "
-            f"{len(training_records)}"
-        )
-
-        previous_training_records = []
-        if existing_records:
-            prev_category_counts = {}
-            for rec in existing_records:
+        if usable_categories:
+            for rec in final_records:
                 cid = rec.get("pim_category_id")
                 if cid is None:
                     continue
-                cid_str = str(cid).strip()
-                if not cid_str:
-                    continue
-                prev_category_counts[cid_str] = prev_category_counts.get(cid_str, 0) + 1
-
-            log_info(
-                logger,
-                "STEP C: Computed product counts for previous Stable Training Dataset "
-                f"with {len(prev_category_counts)} distinct pim_category_id values.",
-            )
-            print(
-                "DEBUG: STEP C – previous training distinct pim_category_id count: "
-                f"{len(prev_category_counts)}"
-            )
-
-            prev_usable_categories = [
-                cid for cid, cnt in prev_category_counts.items()
-                if cnt >= MIN_PRODUCTS_FOR_TRAINING
-            ]
-
-            log_info(
-                logger,
-                "STEP C: Previous Stable Training Dataset – "
-                f"{len(prev_usable_categories)} PIM categories meet the minimum "
-                f"threshold of {MIN_PRODUCTS_FOR_TRAINING} products for training.",
-            )
-            print(
-                "DEBUG: STEP C – previous usable_categories (>= "
-                f"{MIN_PRODUCTS_FOR_TRAINING} products): "
-                f"{len(prev_usable_categories)} -> {prev_usable_categories}"
-            )
-
-            prev_usable_set = set(prev_usable_categories)
-            previous_training_records = [
-                normalize_training_record(rec)
-                for rec in existing_records
-                if str(rec.get("pim_category_id") or "").strip() in prev_usable_set
-            ]
-
-            print(
-                "DEBUG: STEP C – previous_training_records count after filtering: "
-                f"{len(previous_training_records)}"
-            )
-        else:
-            previous_training_records = []
-
-        if training_records:
-            sample = training_records[0]
-            print(
-                "DEBUG: STEP C – sample training_record type:",
-                type(sample).__name__,
-            )
-            try:
-                sample_keys = list(sample.keys())
-                print("DEBUG: STEP C – sample training_record keys:", sample_keys)
-            except Exception as e_keys:
-                print(
-                    "DEBUG: STEP C – could not read sample training_record keys:",
-                    repr(e_keys),
-                )
-        else:
-            print("DEBUG: STEP C – training_records is empty list")
-
-        # =========================================================
-        # STEP D: Prepare training subset for KEYWORD statistics
-        # =========================================================
-        current_step = "STEP D: Generate conservative KEYWORD-based rule proposals"
-        log_info(logger, current_step)
+                cid_str = str(cid)
+                if cid_str in usable_categories:
+                    training_records.append(rec)
 
         log_info(
             logger,
-            "STEP D: Generating conservative KEYWORD-based rule proposals "
-            "from training subset and this vendor's matches...",
+            f"DEBUG: STEP C – training_records count after filtering: {len(training_records)}",
+        )
+        print(
+            "DEBUG: STEP C – training_records count after filtering:",
+            len(training_records),
+        )
+
+        previous_training_records = []
+
+        if s3_key_exists(s3_client, INPUT_BUCKET, training_subset_key):
+            prev_data = read_json_from_s3(
+                s3_client, INPUT_BUCKET, training_subset_key
+            )
+            if isinstance(prev_data, list):
+                previous_training_records = [
+                    normalise_training_record(rec) for rec in prev_data
+                ]
+            else:
+                previous_training_records = []
+        else:
+            previous_training_records = []
+
+        prev_category_counts: Dict[str, int] = {}
+        for rec in previous_training_records:
+            cid = rec.get("pim_category_id")
+            if cid is None:
+                continue
+            cid_str = str(cid)
+            prev_category_counts[cid_str] = prev_category_counts.get(cid_str, 0) + 1
+
+        prev_usable_categories = [
+            cid_str
+            for cid_str, count in prev_category_counts.items()
+            if count >= MIN_PRODUCTS_FOR_TRAINING
+        ]
+
+        log_info(
+            logger,
+            "DEBUG: STEP C – previous training distinct pim_category_id count: "
+            f"{len(prev_category_counts)}",
+        )
+        print(
+            "DEBUG: STEP C – previous training distinct pim_category_id count:",
+            len(prev_category_counts),
+        )
+        log_info(
+            logger,
+            "DEBUG: STEP C – previous usable_categories (>= "
+            f"{MIN_PRODUCTS_FOR_TRAINING} products): "
+            f"{len(prev_usable_categories)} -> {prev_usable_categories}",
+        )
+        print(
+            "DEBUG: STEP C – previous usable_categories (>= "
+            f"{MIN_PRODUCTS_FOR_TRAINING} products):",
+            len(prev_usable_categories),
+            "->",
+            prev_usable_categories,
+        )
+
+        log_info(
+            logger,
+            f"DEBUG: STEP C – previous_training_records count after filtering: {len(previous_training_records)}",
+        )
+        print(
+            "DEBUG: STEP C – previous_training_records count after filtering:",
+            len(previous_training_records),
+        )
+
+        if training_records:
+            log_info(
+                logger,
+                "DEBUG: STEP C – sample training_record type: "
+                f"{type(training_records[0]).__name__}",
+            )
+            print(
+                "DEBUG: STEP C – sample training_record type:",
+                type(training_records[0]).__name__,
+            )
+            log_info(
+                logger,
+                "DEBUG: STEP C – sample training_record keys: "
+                f"{list(training_records[0].keys())}",
+            )
+            print(
+                "DEBUG: STEP C – sample training_record keys:",
+                list(training_records[0].keys()),
+            )
+
+        write_json_to_s3(
+            s3_client,
+            INPUT_BUCKET,
+            training_subset_key,
+            training_records,
+            indent=2,
+            logger=logger,
+        )
+
+        # =========================================================
+        # STEP D: Build KEYWORD statistics for K1 and K2
+        # =========================================================
+        current_step = "STEP D: Build KEYWORD statistics and rule proposals"
+
+        log_info(
+            logger,
+            f"DEBUG: STEP D – starting rule proposal generation; training_records={len(training_records)}",
         )
         print(
             "DEBUG: STEP D – starting rule proposal generation; "
             f"training_records={len(training_records)}"
         )
 
-        if not training_records:
-            log_info(
-                logger,
-                "STEP D: Training subset is empty (no categories above threshold). "
-                "Skipping rule proposal generation. "
-                "No rule proposal file will be created.",
-            )
-            log_info(logger, "========== JOB END (SUCCESS) ==========")
-            print(
-                "DEBUG: EARLY EXIT – STEP D: training subset empty; "
-                "no rule proposals will be generated"
-            )
-            job.commit()
-            return
-
-        # ---------- STEP D1: Create DataFrame from training_records ----------
-        current_step = "STEP D1: Create DataFrame from training_records"
-        log_info(logger, current_step)
+        # ---------------------------------------------------------
+        # STEP D1: Create Spark DataFrame from training_records
+        # ---------------------------------------------------------
+        current_step = "STEP D1: Create Spark DataFrame from training_records"
+        log_info(logger, "DEBUG: STEP D1 – creating DataFrame from training_records")
         print("DEBUG: STEP D1 – creating DataFrame from training_records")
-        print(f"DEBUG: STEP D1 – training_records length: {len(training_records)}")
+
+        training_schema = T.StructType(
+            [
+                T.StructField("pim_category_id", T.StringType(), True),
+                T.StructField("pim_category_name", T.StringType(), True),
+                T.StructField("pim_category_path", T.StringType(), True),
+                T.StructField("vendor_short_name", T.StringType(), True),
+                T.StructField("vendor_category_id", T.StringType(), True),
+                T.StructField("vendor_category_name", T.StringType(), True),
+                T.StructField("vendor_category_path", T.StringType(), True),
+                T.StructField("article_id", T.StringType(), True),
+                T.StructField("description_short", T.StringType(), True),
+                T.StructField("keywords", T.ArrayType(T.StringType()), True),
+                T.StructField("class_codes", T.ArrayType(T.StringType()), True),
+            ]
+        )
+
+        if not training_records:
+            log_warning(
+                logger,
+                "STEP D1: No training_records available after filtering; "
+                "cannot compute keyword statistics.",
+            )
+            print(
+                "[LOG-WARN-FAILED] STEP D1: No training_records available; "
+                "cannot compute keyword statistics."
+            )
+            training_df = spark.createDataFrame([], schema=training_schema)
+        else:
+            training_df = spark.createDataFrame(training_records, schema=training_schema)
+
+        log_info(
+            logger,
+            f"DEBUG: STEP D1 – training_records length: {len(training_records)}",
+        )
+        print(
+            "DEBUG: STEP D1 – training_records length:",
+            len(training_records),
+        )
 
         if training_records:
-            sample = training_records[0]
-            print("DEBUG: STEP D1 – sample record type:", type(sample).__name__)
-            try:
-                sample_keys = list(sample.keys())
-                print("DEBUG: STEP D1 – sample record keys:", sample_keys)
-            except Exception as e_keys:
-                print(
-                    "DEBUG: STEP D1 – could not read sample record keys:",
-                    repr(e_keys),
-                )
-            try:
-                print("DEBUG: STEP D1 – sample record:", json.dumps(sample)[:500])
-            except Exception as e_json:
-                print(
-                    "DEBUG: STEP D1 – could not JSON-serialise sample record:",
-                    repr(e_json),
-                )
-
-        training_schema = StructType([
-            StructField("pim_category_id", StringType(), True),
-            StructField("pim_category_name", StringType(), True),
-            StructField("pim_category_path", StringType(), True),
-            StructField("vendor_short_name", StringType(), True),
-            StructField("vendor_category_id", StringType(), True),
-            StructField("vendor_category_name", StringType(), True),
-            StructField("vendor_category_path", StringType(), True),
-            StructField("article_id", StringType(), True),
-            StructField("description_short", StringType(), True),
-            StructField("keywords", ArrayType(StringType()), True),
-            StructField(
-                "class_codes",
-                ArrayType(
-                    StructType([
-                        StructField("system", StringType(), True),
-                        StructField("code", StringType(), True),
-                    ])
-                ),
-                True,
-            ),
-        ])
-
-        try:
-            df_train = glue_context.spark_session.createDataFrame(
-                training_records,
-                schema=training_schema,
-            )
-        except Exception as e_df:
-            log_error(
-                logger,
-                "STEP D1: Failed to create DataFrame from training_records. "
-                "No rule proposals will be generated.",
-            )
-            log_error(logger, repr(e_df))
+            sample_rec = training_records[0]
+            print("DEBUG: STEP D1 – sample record type:")
+            print(type(sample_rec).__name__)
+            print("DEBUG: STEP D1 – sample record keys:")
+            print(list(sample_rec.keys()))
+            print("DEBUG: STEP D1 – sample record:")
             print(
-                "DEBUG: STEP D1 – DataFrame creation from training_records failed; "
-                "no rule proposals will be generated"
-            )
-            job.commit()
-            return
-
-        for col_name in ["pim_category_id", "article_id", "keywords"]:
-            if col_name not in df_train.columns:
-                log_warning(
-                    logger,
-                    f"STEP D1: Column '{col_name}' missing in training DataFrame; "
-                    "adding it as NULL.",
-                )
-                df_train = df_train.withColumn(col_name, F.lit(None))
-                print(
-                    f"DEBUG: STEP D1 – column '{col_name}' missing "
-                    "in df_train; added as NULL"
-                )
-
-        if previous_training_records:
-            current_step = "STEP D1: Prepare previous training KEYWORD pairs"
-            log_info(logger, current_step)
-            print(
-                "DEBUG: STEP D1 – building previous training KEYWORD pairs "
-                "from previous_training_records"
-            )
-            try:
-                df_prev_train = glue_context.spark_session.createDataFrame(
-                    [Row(**r) for r in previous_training_records]
-                )
-            except Exception as e_prev:
-                log_warning(
-                    logger,
-                    "STEP D1: Could not create DataFrame from previous_training_records. "
-                    "New rule detection will treat all candidates as 'existing'.",
-                )
-                print(
-                    "DEBUG: STEP D1 – DataFrame creation from previous_training_records "
-                    "failed; proceeding without previous training info"
-                )
-                df_prev_kw = glue_context.spark_session.createDataFrame(
-                    [], schema="pim_category_id string, keyword string"
-                )
-            else:
-                for col_name in ["pim_category_id", "keywords"]:
-                    if col_name not in df_prev_train.columns:
-                        df_prev_train = df_prev_train.withColumn(col_name, F.lit(None))
-                df_prev_kw = (
-                    df_prev_train
-                    .select(
-                        F.col("pim_category_id").alias("pim_category_id"),
-                        F.explode_outer("keywords").alias("keyword"),
-                    )
-                    .where(
-                        F.col("keyword").isNotNull()
-                        & (F.trim(F.col("keyword")) != F.lit(""))
-                    )
-                    .dropDuplicates(["pim_category_id", "keyword"])
-                )
-        else:
-            df_prev_kw = glue_context.spark_session.createDataFrame(
-                [], schema="pim_category_id string, keyword string"
+                json.dumps(
+                    sample_rec, indent=2, ensure_ascii=False
+                )[:1000]
             )
 
-        # ---------- STEP D2: Explode KEYWORD terms from training subset ----------
-        current_step = "STEP D2: Explode KEYWORD terms from training subset"
-        log_info(logger, current_step)
+        # ---------------------------------------------------------
+        # STEP D1 (previous training): Create DataFrame for previous_training_records
+        # ---------------------------------------------------------
+        prev_training_df = spark.createDataFrame(
+            previous_training_records, schema=training_schema
+        )
+
+        prev_kw_df = (
+            prev_training_df
+            .withColumn("keyword", F.explode(F.col("keywords")))
+            .select("pim_category_id", "keyword")
+            .distinct()
+        )
+
+        # ---------------------------------------------------------
+        # STEP D2: Compute KEYWORD statistics at training level
+        # ---------------------------------------------------------
+        current_step = "STEP D2: Compute KEYWORD statistics at training level"
+        log_info(
+            logger, "DEBUG: STEP D2 – exploding KEYWORD terms from training subset"
+        )
         print("DEBUG: STEP D2 – exploding KEYWORD terms from training subset")
 
-        df_kw_train = (
-            df_train
+        kw_train_df = (
+            training_df
+            .withColumn("keyword", F.explode(F.col("keywords")))
             .select(
-                F.col("pim_category_id").alias("pim_category_id"),
-                F.col("article_id").alias("article_id"),
-                F.explode_outer("keywords").alias("keyword"),
-            )
-            .where(
-                F.col("keyword").isNotNull()
-                & (F.trim(F.col("keyword")) != F.lit(""))
+                "pim_category_id",
+                "article_id",
+                "keyword",
             )
         )
 
-        current_step = "STEP D2: Compute inside_count and total training counts"
-        log_info(logger, current_step)
+        log_info(
+            logger,
+            "DEBUG: STEP D2 – computing inside_count and train_total_count",
+        )
         print("DEBUG: STEP D2 – computing inside_count and train_total_count")
 
-        df_inside = (
-            df_kw_train
-            .groupBy("pim_category_id", "keyword")
-            .agg(F.count(F.lit(1)).alias("inside_count"))
+        train_insides = (
+            kw_train_df.groupBy("pim_category_id", "keyword")
+            .agg(
+                F.countDistinct("article_id").alias("inside_count"),
+            )
         )
 
-        df_total_train = (
-            df_kw_train
-            .groupBy("keyword")
-            .agg(F.count(F.lit(1)).alias("train_total_count"))
+        keyword_global = (
+            kw_train_df.groupBy("keyword")
+            .agg(
+                F.countDistinct("article_id").alias("train_total_count"),
+            )
         )
 
         df_stats = (
-            df_inside
-            .join(df_total_train, on="keyword", how="left")
+            train_insides.join(keyword_global, on="keyword", how="left")
             .withColumn(
                 "hard_outside_count",
                 F.col("train_total_count") - F.col("inside_count"),
@@ -922,137 +1009,105 @@ def main():
 
         log_info(
             logger,
-            "STEP D2: Completed computation of inside_count, train_total_count "
-            "and hard_outside_count.",
+            "DEBUG: STEP D2 – completed inside_count/train_total_count/hard_outside_count computation",
         )
         print(
-            "DEBUG: STEP D2 – completed inside_count/train_total_count/"
-            "hard_outside_count computation"
+            "DEBUG: STEP D2 – completed inside_count/train_total_count/hard_outside_count computation"
         )
 
-        # =========================================================
-        # STEP D3: Build vendor KEYWORD statistics
-        # =========================================================
-        current_step = "STEP D3: Build vendor KEYWORD statistics"
-        log_info(logger, current_step)
+        # ---------------------------------------------------------
+        # STEP D3: Compute vendor KEYWORD statistics for the current vendor
+        # ---------------------------------------------------------
+        current_step = "STEP D3: Compute vendor KEYWORD statistics"
+        log_info(
+            logger, "DEBUG: STEP D3 – building vendor KEYWORD statistics from match_data"
+        )
         print("DEBUG: STEP D3 – building vendor KEYWORD statistics from match_data")
 
-        vendor_kw_rows = []
+        vendor_kw_rows: List[Dict[str, Any]] = []
+
         for vcat_key, vcat_record in match_data.items():
             if not isinstance(vcat_record, dict):
                 continue
+
+            vcat_id = vcat_record.get("vendor_category_id")
             pim_matches = vcat_record.get("pim_matches") or []
-            if not isinstance(pim_matches, list):
-                continue
-
-            for m in pim_matches:
-                if not isinstance(m, dict):
+            for pim_match in pim_matches:
+                if not isinstance(pim_match, dict):
                     continue
 
-                pim_category_id = m.get("pim_category_id")
-                products = m.get("products") or []
-                if not isinstance(products, list):
-                    continue
-
-                for p in products:
-                    if not isinstance(p, dict):
+                pim_cat_id = pim_match.get("pim_category_id")
+                products = pim_match.get("products") or []
+                for product in products:
+                    if not isinstance(product, dict):
                         continue
-                    article_id = p.get("article_id")
-                    raw_keywords = p.get("keywords")
-                    if raw_keywords is None:
-                        kws = []
-                    elif isinstance(raw_keywords, list):
-                        kws = raw_keywords
-                    else:
-                        kws = [raw_keywords]
 
-                    for kw in kws:
-                        if kw is None:
-                            continue
-                        kw_str = str(kw).strip()
-                        if not kw_str:
-                            continue
+                    article_id = product.get("article_id")
+                    raw_keywords = product.get("keywords")
+                    keywords = normalise_keywords(raw_keywords)
+
+                    for kw in keywords:
                         vendor_kw_rows.append(
                             {
-                                "pim_category_id": str(pim_category_id)
-                                if pim_category_id is not None
-                                else None,
-                                "article_id": str(article_id)
-                                if article_id is not None
-                                else None,
-                                "keyword": kw_str,
+                                "pim_category_id": str(pim_cat_id),
+                                "article_id": str(article_id),
+                                "keyword": kw,
                             }
                         )
 
+        vendor_kw_schema = T.StructType(
+            [
+                T.StructField("pim_category_id", T.StringType(), True),
+                T.StructField("article_id", T.StringType(), True),
+                T.StructField("keyword", T.StringType(), True),
+            ]
+        )
+
         if vendor_kw_rows:
-            df_kw_vendor = glue_context.spark_session.createDataFrame(
-                vendor_kw_rows,
-                schema=StructType([
-                    StructField("pim_category_id", StringType(), True),
-                    StructField("article_id", StringType(), True),
-                    StructField("keyword", StringType(), True),
-                ]),
-            )
-
-            df_vendor_inside = (
-                df_kw_vendor
-                .groupBy("pim_category_id", "keyword")
-                .agg(F.count(F.lit(1)).alias("vendor_inside_count"))
-            )
-
-            df_vendor_total = (
-                df_kw_vendor
-                .groupBy("keyword")
-                .agg(F.count(F.lit(1)).alias("vendor_total_count"))
-            )
-
-            log_info(
-                logger,
-                "STEP D3: Built vendor keyword statistics "
-                "(vendor_inside_count, vendor_total_count).",
-            )
-            print(
-                "DEBUG: STEP D3 – built vendor_inside_count/"
-                "vendor_total_count "
-                "DataFrames"
-            )
+            vendor_kw_df = spark.createDataFrame(vendor_kw_rows, schema=vendor_kw_schema)
         else:
-            log_info(
-                logger,
-                "STEP D3: No keyword entries found in vendor oneVendor_to_onePim "
-                "data. Rule proposals will be based only on global training statistics.",
-            )
-            print(
-                "DEBUG: STEP D3 – no keyword entries found in vendor data; "
-                "vendor stats will be empty"
-            )
-            df_vendor_inside = glue_context.spark_session.createDataFrame(
-                [], schema="pim_category_id string, keyword string, vendor_inside_count long"
-            )
-            df_vendor_total = glue_context.spark_session.createDataFrame(
-                [], schema="keyword string, vendor_total_count long"
-            )
+            vendor_kw_df = spark.createDataFrame([], schema=vendor_kw_schema)
 
-        current_step = "STEP D3: Join training and vendor statistics"
-        log_info(logger, current_step)
-        print("DEBUG: STEP D3 – joining training and vendor keyword statistics")
+        log_info(
+            logger,
+            "DEBUG: STEP D3 – built vendor_inside_count/vendor_total_count DataFrames",
+        )
+        print(
+            "DEBUG: STEP D3 – built vendor_inside_count/vendor_total_count DataFrames"
+        )
+
+        vendor_inside_df = (
+            vendor_kw_df.groupBy("pim_category_id", "keyword")
+            .agg(
+                F.countDistinct("article_id").alias("vendor_inside_count"),
+            )
+        )
+
+        vendor_global_df = (
+            vendor_kw_df.groupBy("keyword")
+            .agg(
+                F.countDistinct("article_id").alias("vendor_total_count"),
+            )
+        )
 
         df_stats = (
-            df_stats
-            .join(
-                df_vendor_inside,
+            df_stats.join(
+                vendor_inside_df,
                 on=["pim_category_id", "keyword"],
                 how="left",
             )
             .join(
-                df_vendor_total,
+                vendor_global_df,
                 on="keyword",
                 how="left",
             )
         )
 
         df_stats = df_stats.fillna(
-            {"vendor_inside_count": 0, "vendor_total_count": 0}
+            {
+                "vendor_inside_count": 0,
+                "vendor_total_count": 0,
+            }
         )
 
         df_stats = df_stats.withColumn(
@@ -1062,19 +1117,24 @@ def main():
 
         log_info(
             logger,
-            "STEP D3: Completed join of training and vendor statistics and "
-            "computed vendor_outside_count.",
+            "DEBUG: STEP D3 – joined training and vendor statistics and vendor_outside_count computation",
         )
         print(
-            "DEBUG: STEP D3 – completed join of training and vendor statistics "
-            "and vendor_outside_count computation"
+            "DEBUG: STEP D3 – joined training and vendor statistics and vendor_outside_count computation"
         )
 
-        # =========================================================
-        # STEP D5: Apply thresholds and derive rule status for each (category, keyword)
-        # =========================================================
+        # ---------------------------------------------------------
+        # STEP D5: Apply thresholds (K1) and build rule_status + K2 extension
+        # ---------------------------------------------------------
         current_step = "STEP D5: Apply thresholds and derive rule status"
-        log_info(logger, current_step)
+        log_info(
+            logger,
+            "DEBUG: STEP D5 – applying thresholds and deriving rule status: "
+            f"MIN_KEYWORD_INSIDE_SUPPORT={MIN_KEYWORD_INSIDE_SUPPORT}, "
+            f"MAX_KEYWORD_HARD_OUTSIDE={MAX_KEYWORD_HARD_OUTSIDE}, "
+            f"MIN_VENDOR_INSIDE_SUPPORT={MIN_VENDOR_INSIDE_SUPPORT}, "
+            f"MAX_VENDOR_OUTSIDE_SUPPORT={MAX_VENDOR_OUTSIDE_SUPPORT}",
+        )
         print(
             "DEBUG: STEP D5 – applying thresholds and deriving rule status: "
             f"MIN_KEYWORD_INSIDE_SUPPORT={MIN_KEYWORD_INSIDE_SUPPORT}, "
@@ -1091,37 +1151,65 @@ def main():
         )
 
         conservative_count = df_candidates.limit(1).count()
-        if conservative_count == 0:
+        if conservative_count > 0:
             log_info(
                 logger,
-                "STEP D5: No KEYWORD terms met the very conservative thresholds "
-                "for this vendor. Rule proposals will therefore likely be empty "
-                "(no candidate KEYWORD rules above thresholds).",
+                "DEBUG: STEP D5 – at least one candidate KEYWORD term passes conservative filters",
             )
             print(
-                "DEBUG: STEP D5 – no KEYWORD terms met conservative thresholds; "
-                "rule proposal set may be empty"
+                "DEBUG: STEP D5 – at least one candidate KEYWORD term passes conservative filters"
             )
         else:
             log_info(
                 logger,
-                f"STEP D5: Found at least one KEYWORD term ({conservative_count}+) "
-                "that meets the very conservative thresholds.",
+                "DEBUG: STEP D5 – no KEYWORD term passes conservative filters; K1 rules will be empty",
             )
             print(
-                "DEBUG: STEP D5 – at least one candidate KEYWORD term passes "
-                "conservative filters"
+                "DEBUG: STEP D5 – no KEYWORD term passes conservative filters; K1 rules will be empty"
             )
 
         current_step = "STEP D5: Join with previous training pairs for new-rule detection"
-        log_info(logger, current_step)
+        log_info(
+            logger,
+            "DEBUG: STEP D5 – building previous training KEYWORD pairs from previous_training_records",
+        )
         print(
-            "DEBUG: STEP D5 – joining df_stats with previous training KEYWORD pairs"
+            "DEBUG: STEP D5 – building previous training KEYWORD pairs from previous_training_records",
         )
 
+        try:
+            df_prev_kw = prev_kw_df
+            prev_kw_distinct = df_prev_kw.count()
+            log_info(
+                logger,
+                f"DEBUG: STEP D5 – distinct (pim_category_id, keyword) pairs in previous training: {prev_kw_distinct}",
+            )
+            print(
+                "DEBUG: STEP D5 – distinct (pim_category_id, keyword) pairs in previous training:",
+                prev_kw_distinct,
+            )
+        except Exception as e:
+            log_warning(
+                logger,
+                f"STEP D5: Could not create DataFrame from previous_training_records. "
+                f"K1 new rule detection will treat all candidates as 'new'. | {e}",
+            )
+            print(
+                "[LOG-WARN-FAILED] STEP D5: Could not create DataFrame from previous_training_records. "
+                "K1 new rule detection will treat all candidates as 'new'."
+            )
+            df_prev_kw = spark.createDataFrame(
+                [],
+                schema=T.StructType(
+                    [
+                        T.StructField("pim_category_id", T.StringType(), True),
+                        T.StructField("keyword", T.StringType(), True),
+                    ]
+                ),
+            )
+
         df_stats = (
-            df_stats
-            .join(
+            df_stats.join(
                 df_prev_kw.withColumn("known_in_previous_training", F.lit(True)),
                 on=["pim_category_id", "keyword"],
                 how="left",
@@ -1130,8 +1218,7 @@ def main():
         )
 
         df_stats = (
-            df_stats
-            .withColumn(
+            df_stats.withColumn(
                 "has_vendor_usage",
                 F.col("vendor_total_count") > F.lit(0),
             )
@@ -1158,7 +1245,7 @@ def main():
         )
 
         current_step = "STEP D5: Classify vendor_status per rule"
-        log_info(logger, current_step)
+        log_info(logger, "DEBUG: STEP D5 – classifying vendor_status per (category, keyword)")
         print("DEBUG: STEP D5 – classifying vendor_status per (category, keyword)")
 
         df_stats = df_stats.withColumn(
@@ -1195,32 +1282,130 @@ def main():
             if cid_str not in category_path_map and rec.get("pim_category_path") is not None:
                 category_path_map[cid_str] = rec.get("pim_category_path")
 
+        # ---------------------------------------------------------------------
+        # Build helper indices for K2 logic (contains_any_exclude_any rules)
+        # We reuse the in-memory training_records and match_data so we do not
+        # change the existing Spark-based counting logic for K1.
+        # ---------------------------------------------------------------------
+        print("DEBUG: STEP D5 – building helper indices for K2 logic")
+        training_kw_occurrences = {}
+        for rec in training_records:
+            cid = rec.get("pim_category_id")
+            if cid is None:
+                continue
+            cid_str = str(cid)
+            kw_list = rec.get("keywords") or []
+            # keywords in training_records are already normalised lists of strings
+            kw_set = set([k for k in kw_list if isinstance(k, str) and k.strip() != ""])
+            if not kw_set:
+                continue
+            for kw in kw_set:
+                training_kw_occurrences.setdefault(kw, []).append(
+                    {
+                        "pim_category_id": cid_str,
+                        "keywords_set": kw_set,
+                    }
+                )
+
+        print(
+            "DEBUG: STEP D5 – training_kw_occurrences built for keywords:",
+            len(training_kw_occurrences),
+        )
+
+        # Build vendor keyword occurrences per keyword from match_data
+        vendor_kw_occurrences = {}
+        try:
+            for vcat_key, vcat_record in match_data.items():
+                if not isinstance(vcat_record, dict):
+                    continue
+                pim_matches = vcat_record.get("pim_matches") or []
+                for pim_match in pim_matches:
+                    if not isinstance(pim_match, dict):
+                        continue
+                    pim_category_id = pim_match.get("pim_category_id")
+                    pim_category_id_str = (
+                        str(pim_category_id) if pim_category_id is not None else None
+                    )
+                    products = pim_match.get("products") or []
+                    for product in products:
+                        if not isinstance(product, dict):
+                            continue
+                        raw_keywords = product.get("keywords")
+                        if raw_keywords is None:
+                            kw_list = []
+                        elif isinstance(raw_keywords, list):
+                            kw_list = [
+                                str(k)
+                                for k in raw_keywords
+                                if k is not None and str(k).strip() != ""
+                            ]
+                        else:
+                            kw_str = str(raw_keywords)
+                            kw_list = [kw_str] if kw_str.strip() != "" else []
+                        if not kw_list:
+                            continue
+                        kw_set = set(kw_list)
+                        for kw in kw_set:
+                            kw_s = kw.strip()
+                            if not kw_s:
+                                continue
+                            vendor_kw_occurrences.setdefault(kw_s, []).append(
+                                {
+                                    "pim_category_id": pim_category_id_str,
+                                    "keywords_set": kw_set,
+                                }
+                            )
+        except Exception as e:
+            log_warning(
+                logger,
+                f"STEP D5: Failed to build vendor_kw_occurrences for K2 logic: {e}",
+            )
+
+        print(
+            "DEBUG: STEP D5 – vendor_kw_occurrences built for keywords:",
+            len(vendor_kw_occurrences),
+        )
+
+        # ---------------------------------------------------------------------
+        # K1 RULES (unchanged): contains_any with hard_outside_count == 0
+        # ---------------------------------------------------------------------
         # Keep only rules that actually meet the global candidate thresholds
         # and have a meaningful vendor_status (new / supported / violated / not_impacted).
-        df_output = df_stats.where(
+        df_output_k1 = df_stats.where(
             F.col("global_candidate") & F.col("vendor_status").isNotNull()
         )
 
-        current_step = "STEP D5: Collect rule status rows to driver"
-        log_info(logger, current_step)
-        print("DEBUG: STEP D5 – collecting full rule status rows to driver")
-
-        rows = df_output.collect()
+        print(
+            "DEBUG: STEP D5 – df_output_k1.count() will be collected on driver"
+        )
+        rows_k1 = df_output_k1.collect()
         rule_proposals = []
 
-        for r in rows:
+        for r in rows_k1:
             pim_category_id = r["pim_category_id"]
-            pim_category_id_str = str(pim_category_id) if pim_category_id is not None else None
+            pim_category_id_str = (
+                str(pim_category_id) if pim_category_id is not None else None
+            )
             pim_category_name = category_name_map.get(pim_category_id_str)
             keyword = r["keyword"]
 
             inside_count = int(r["inside_count"]) if r["inside_count"] is not None else 0
-            train_total_count = int(r["train_total_count"]) if r["train_total_count"] is not None else 0
-            hard_outside_count = int(r["hard_outside_count"]) if r["hard_outside_count"] is not None else 0
-            vendor_inside_count = int(r["vendor_inside_count"]) if r["vendor_inside_count"] is not None else 0
-            vendor_total_count = int(r["vendor_total_count"]) if r["vendor_total_count"] is not None else 0
-            vendor_outside_count = int(r["vendor_outside_count"]) if r["vendor_outside_count"] is not None else 0
-            vendor_status = r["vendor_status"] if r["vendor_status"] is not None else None
+            train_total_count = (
+                int(r["train_total_count"]) if r["train_total_count"] is not None else 0
+            )
+            hard_outside_count = (
+                int(r["hard_outside_count"]) if r["hard_outside_count"] is not None else 0
+            )
+            vendor_inside_count = (
+                int(r["vendor_inside_count"]) if r["vendor_inside_count"] is not None else 0
+            )
+            vendor_total_count = (
+                int(r["vendor_total_count"]) if r["vendor_total_count"] is not None else 0
+            )
+            vendor_outside_count = (
+                int(r["vendor_outside_count"]) if r["vendor_outside_count"] is not None else 0
+            )
+            vendor_status = r["vendor_status"]
 
             rule_obj = {
                 "pim_category_id": pim_category_id,
@@ -1241,13 +1426,176 @@ def main():
             }
             rule_proposals.append(rule_obj)
 
+        print(
+            "DEBUG: STEP D5 – K1 rule proposals built:", len(rule_proposals)
+        )
+
+        # ---------------------------------------------------------------------
+        # K2 RULES: contains_any_exclude_any for keywords where K1 fails only
+        # because hard_outside_count > 0.
+        # ---------------------------------------------------------------------
+        print("DEBUG: STEP D5 – starting K2 candidate evaluation")
+        df_k2_candidates = df_stats.where(
+            (F.col("inside_count") >= F.lit(MIN_KEYWORD_INSIDE_SUPPORT))
+            & (F.col("hard_outside_count") > F.lit(MAX_KEYWORD_HARD_OUTSIDE))
+        )
+
+        k2_rows = df_k2_candidates.select(
+            "pim_category_id",
+            "keyword",
+            "inside_count",
+            "train_total_count",
+            "hard_outside_count",
+            "known_in_previous_training",
+        ).collect()
+
+        print(
+            "DEBUG: STEP D5 – K2 candidate rows collected:",
+            len(k2_rows),
+        )
+
+        accepted_k2_rules = 0
+
+        for r in k2_rows:
+            pim_category_id = r["pim_category_id"]
+            if pim_category_id is None:
+                continue
+            pim_category_id_str = str(pim_category_id)
+            keyword = r["keyword"]
+            if not keyword:
+                continue
+            keyword_str = str(keyword)
+
+            # Occurrences of this keyword in training (inside vs outside the category)
+            occ_list = training_kw_occurrences.get(keyword_str)
+            if not occ_list:
+                continue
+
+            inside_sets = [
+                o["keywords_set"]
+                for o in occ_list
+                if o["pim_category_id"] == pim_category_id_str
+            ]
+            outside_sets = [
+                o["keywords_set"]
+                for o in occ_list
+                if o["pim_category_id"] != pim_category_id_str
+            ]
+
+            # By definition of K2 we only care where there are outside uses
+            if not outside_sets:
+                continue
+
+            inside_tokens = set()
+            for s in inside_sets:
+                inside_tokens |= s
+
+            outside_tokens = set()
+            for s in outside_sets:
+                outside_tokens |= s
+
+            # Exclude candidates: tokens that appear only in outside sets,
+            # never in the inside sets for this (category, keyword).
+            exclude_candidates = outside_tokens - inside_tokens
+            if not exclude_candidates:
+                # There is no token that is unique to outside categories,
+                # so we cannot cleanly eliminate outside usage via excludes.
+                continue
+
+            # Coverage check: every outside occurrence of the keyword must contain
+            # at least one exclude token, otherwise hard_outside_count after
+            # applying K2 would still be > 0.
+            coverage_ok = True
+            for s in outside_sets:
+                if not (s & exclude_candidates):
+                    coverage_ok = False
+                    break
+
+            if not coverage_ok:
+                # We cannot achieve hard_outside_count == 0 without excluding
+                # tokens that are also present in the inside category, so skip.
+                continue
+
+            # At this point K2 can be constructed with E = exclude_candidates.
+            # By construction:
+            # - inside_count_K2 == inside_count_K1
+            # - hard_outside_count_K2 == 0
+            inside_count = int(r["inside_count"]) if r["inside_count"] is not None else 0
+            if inside_count < MIN_KEYWORD_INSIDE_SUPPORT:
+                # Safety check; should not happen due to df_k2_candidates filter.
+                continue
+
+            # Compute vendor statistics under K2 semantics:
+            vendor_occ_list = vendor_kw_occurrences.get(keyword_str, [])
+            vendor_inside_k2 = 0
+            vendor_total_k2 = 0
+            vendor_outside_k2 = 0
+
+            for occ in vendor_occ_list:
+                v_cid = occ.get("pim_category_id")
+                kw_set = occ.get("keywords_set") or set()
+                # Skip contexts that contain any exclude token:
+                if kw_set & exclude_candidates:
+                    continue
+                vendor_total_k2 += 1
+                if v_cid == pim_category_id_str:
+                    vendor_inside_k2 += 1
+                else:
+                    vendor_outside_k2 += 1
+
+            # Derive vendor_status for K2
+            if vendor_total_k2 == 0:
+                vendor_status_k2 = "not_impacted"
+            elif (
+                vendor_inside_k2 >= MIN_VENDOR_INSIDE_SUPPORT
+                and vendor_outside_k2 <= MAX_VENDOR_OUTSIDE_SUPPORT
+            ):
+                # Use previous-training information to distinguish "new" vs "supported"
+                known_prev = bool(r["known_in_previous_training"])
+                vendor_status_k2 = "supported" if known_prev else "new"
+            else:
+                # Vendor violates the K2 rule; do not propose it.
+                continue
+
+            # K2 global candidate is always "clean" from training perspective:
+            # we force hard_outside_count_K2 to be 0 while keeping inside_count
+            # identical to K1.
+            values_exclude = sorted(exclude_candidates)
+
+            rule_obj_k2 = {
+                "pim_category_id": pim_category_id,
+                "pim_category_name": category_name_map.get(pim_category_id_str),
+                "field_name": "KEYWORD",
+                "operator": "contains_any_exclude_any",
+                "values_include": [keyword_str],
+                "values_exclude": values_exclude,
+                "stats": {
+                    "inside_count": inside_count,
+                    # After applying excludes all remaining uses are inside the category.
+                    "train_total_count": inside_count,
+                    "hard_outside_count": 0,
+                    "vendor_inside_count": vendor_inside_k2,
+                    "vendor_total_count": vendor_total_k2,
+                    "vendor_outside_count": vendor_outside_k2,
+                    "vendor_status": vendor_status_k2,
+                },
+            }
+
+            rule_proposals.append(rule_obj_k2)
+            accepted_k2_rules += 1
+
+        print(
+            "DEBUG: STEP D5 – accepted K2 rule proposals:",
+            accepted_k2_rules,
+        )
+
         log_info(
             logger,
-            f"STEP D5: Generated {len(rule_proposals)} rule-status entries "
-            f"for vendor={vendor_name}.",
+            f"STEP D5: Generated {len(rule_proposals)} total rule-status entries "
+            f"(K1 + K2) for vendor={vendor_name}.",
         )
         print(
-            "DEBUG: STEP D5 – generated rule-status entries: "
+            "DEBUG: STEP D5 – generated total rule-status entries: "
             f"{len(rule_proposals)}"
         )
 
@@ -1255,361 +1603,108 @@ def main():
         # STEP D6: Write rule proposals JSON to S3
         # =========================================================
         current_step = "STEP D6: Write rule proposals JSON to S3"
-        log_info(logger, current_step)
 
-        ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-        rule_key = (
-            "canonical_mappings/"
-            f"Category_Mapping_RuleProposals_{vendor_name}_{ts}.json"
+        rule_proposals_key = (
+            f"{prepared_output_prefix.rstrip('/')}/"
+            f"ruleProposals_{vendor_name}.json"
         )
 
-        body_rules = json.dumps(rule_proposals, indent=2, ensure_ascii=False)
         log_info(
             logger,
-            "Writing rule proposals to "
-            f"s3://{input_bucket}/{rule_key}",
+            f"DEBUG: STEP D6 – writing rule proposals to s3://{OUTPUT_BUCKET}/{rule_proposals_key}",
         )
         print(
-            "DEBUG: STEP D6 – writing rule proposals to: "
-            f"s3://{input_bucket}/{rule_key}"
+            "DEBUG: STEP D6 – writing rule proposals to s3://"
+            f"{OUTPUT_BUCKET}/{rule_proposals_key}"
         )
 
-        s3_client.put_object(
-            Bucket=input_bucket,
-            Key=rule_key,
-            Body=body_rules.encode("utf-8"),
+        write_json_to_s3(
+            s3_client,
+            OUTPUT_BUCKET,
+            rule_proposals_key,
+            rule_proposals,
+            indent=2,
+            logger=logger,
         )
-
-        log_info(logger, "STEP D6: Rule proposals successfully written to S3.")
 
         # =========================================================
-        # STEP E: Update Category Mapping Reference and write change log
+        # STEP E: Update Category_Mapping_Reference with mapping_methods
         # =========================================================
-        current_step = "STEP E: Update Category Mapping Reference and write change log"
-        log_info(logger, current_step)
-        print("DEBUG: STEP E – updating Category_Mapping_Reference and writing change log")
+        current_step = (
+            "STEP E: Update Category_Mapping_Reference mapping_methods "
+            "from rule_proposals"
+        )
 
-        # Helper: find latest existing Category_Mapping_Reference_*.json
-        prefix_ref = "canonical_mappings/Category_Mapping_Reference_"
-        latest_ref_key = None
+        latest_ref_key, reference_data = load_latest_category_mapping_reference(
+            s3_client, INPUT_BUCKET, logger=logger
+        )
 
-        try:
-            paginator = s3_client.get_paginator("list_objects_v2")
-            page_iterator = paginator.paginate(Bucket=input_bucket, Prefix=prefix_ref)
-            for page in page_iterator:
-                contents = page.get("Contents")
-                if not contents:
-                    continue
-                for obj in contents:
-                    key = obj.get("Key")
-                    if not key or not key.endswith(".json"):
-                        continue
-                    if (latest_ref_key is None) or (key > latest_ref_key):
-                        latest_ref_key = key
-        except Exception as e_list:
-            log_warning(
-                logger,
-                "STEP E: Failed to list existing Category_Mapping_Reference files; "
-                "treating as none.",
-            )
-            log_warning(logger, repr(e_list))
-            latest_ref_key = None
+        reference_index = build_reference_index(reference_data)
+        updated_reference_list, change_log = update_mapping_methods_from_rule_proposals(
+            logger,
+            reference_index,
+            rule_proposals,
+        )
 
-        # Load existing reference (if any)
-        old_reference = []
-        if latest_ref_key:
-            try:
-                log_info(
-                    logger,
-                    f"STEP E: Loading existing Category_Mapping_Reference from "
-                    f"s3://{input_bucket}/{latest_ref_key}",
-                )
-                print(
-                    "DEBUG: STEP E – loading existing reference from: "
-                    f"s3://{input_bucket}/{latest_ref_key}"
-                )
-                ref_obj = s3_client.get_object(Bucket=input_bucket, Key=latest_ref_key)
-                ref_bytes = ref_obj["Body"].read()
-                old_reference = json.loads(ref_bytes.decode("utf-8"))
-                if not isinstance(old_reference, list):
-                    log_warning(
-                        logger,
-                        "STEP E: Existing Category_Mapping_Reference is not a list; "
-                        "ignoring and starting from empty.",
-                    )
-                    print(
-                        "DEBUG: STEP E – existing reference not a list; "
-                        "starting from empty"
-                    )
-                    old_reference = []
-            except ClientError as ce_ref:
-                log_warning(
-                    logger,
-                    "STEP E: ClientError while loading existing reference; "
-                    "starting from empty.",
-                )
-                log_warning(logger, repr(ce_ref))
-                print(
-                    "DEBUG: STEP E – ClientError while loading reference; "
-                    "starting from empty"
-                )
-                old_reference = []
-            except Exception as e_ref:
-                log_warning(
-                    logger,
-                    "STEP E: Unexpected error while loading existing reference; "
-                    "starting from empty.",
-                )
-                log_warning(logger, repr(e_ref))
-                print(
-                    "DEBUG: STEP E – error while loading reference; "
-                    "starting from empty"
-                )
-                old_reference = []
-        else:
-            log_info(
-                logger,
-                "STEP E: No existing Category_Mapping_Reference found; "
-                "new one will be created.",
-            )
-            print("DEBUG: STEP E – no existing Category_Mapping_Reference found")
+        timestamp_str = datetime.datetime.utcnow().strftime("%Y%m%d-%H%M%S")
 
-        # Build mapping pim_category_id -> existing category object
-        ref_by_cat = {}
-        for cat in old_reference:
-            if not isinstance(cat, dict):
-                continue
-            cid = cat.get("pim_category_id")
-            cid_str = str(cid).strip() if cid is not None else None
-            if not cid_str:
-                continue
-            if cid_str not in ref_by_cat:
-                ref_by_cat[cid_str] = cat
-
-        # Start new reference by copying categories and clearing mapping_methods
-        new_ref_by_cat = {}
-        for cid_str, cat in ref_by_cat.items():
-            new_cat = dict(cat)
-            # Ensure vendor_mappings is a list
-            vm = new_cat.get("vendor_mappings")
-            if vm is None:
-                vm = []
-            new_cat["vendor_mappings"] = vm
-            # Clear mapping_methods; will rebuild from rule_proposals
-            new_cat["mapping_methods"] = []
-            new_ref_by_cat[cid_str] = new_cat
-
-        # Build rules_by_cat from rule_proposals, using accepted vendor_status
-        accepted_statuses = {"new", "supported", "not_impacted"}
-        rules_by_cat = {}
-
-        for rule in rule_proposals:
-            stats = rule.get("stats") or {}
-            vendor_status = stats.get("vendor_status")
-            if vendor_status not in accepted_statuses:
-                # skip violated or unknown
-                continue
-
-            pim_category_id = rule.get("pim_category_id")
-            if pim_category_id is None:
-                continue
-            cid_str = str(pim_category_id).strip()
-            if not cid_str:
-                continue
-
-            field_name = rule.get("field_name", "KEYWORD")
-            operator = rule.get("operator", "contains_any")
-            raw_values_include = rule.get("values_include") or []
-            values_include = []
-            for v in raw_values_include:
-                if v is None:
-                    continue
-                v_str = str(v).strip()
-                if v_str:
-                    values_include.append(v_str)
-            if not values_include:
-                continue
-
-            method_obj = {
-                "field_name": field_name,
-                "values_include": values_include,
-                "values_exclude": [],
-                "operator": operator,
-            }
-
-            rules_by_cat.setdefault(cid_str, []).append(method_obj)
-
-        # Ensure new categories from rules exist in new_ref_by_cat
-        for cid_str, methods in rules_by_cat.items():
-            if cid_str not in new_ref_by_cat:
-                new_cat = {
-                    "pim_category_id": cid_str,
-                    "pim_category_name": category_name_map.get(cid_str),
-                    "pim_category_path": category_path_map.get(cid_str),
-                    "vendor_mappings": [],
-                    "mapping_methods": [],
-                }
-                new_ref_by_cat[cid_str] = new_cat
-
-        # Attach mapping_methods per category, deduplicated
-        def rule_signature(method: dict):
-            try:
-                field_name = method.get("field_name")
-                operator = method.get("operator")
-                vi = tuple(sorted(str(v) for v in (method.get("values_include") or [])))
-                ve = tuple(sorted(str(v) for v in (method.get("values_exclude") or [])))
-                return (field_name, operator, vi, ve)
-            except Exception:
-                return None
-
-        for cid_str, methods in rules_by_cat.items():
-            cat = new_ref_by_cat.get(cid_str)
-            if cat is None:
-                continue
-            mm_list = cat.get("mapping_methods") or []
-            sig_set = set()
-            for m in mm_list:
-                sig = rule_signature(m)
-                if sig is not None:
-                    sig_set.add(sig)
-            for m in methods:
-                sig = rule_signature(m)
-                if sig is None:
-                    continue
-                if sig in sig_set:
-                    continue
-                mm_list.append(m)
-                sig_set.add(sig)
-            cat["mapping_methods"] = mm_list
-            new_ref_by_cat[cid_str] = cat
-
-        # Build old_rules_by_cat and new_rules_by_cat for change log
-        old_rules_by_cat = {}
-        for cid_str, cat in ref_by_cat.items():
-            methods = cat.get("mapping_methods") or []
-            rule_map = {}
-            for m in methods:
-                sig = rule_signature(m)
-                if sig is None:
-                    continue
-                rule_map[sig] = m
-            old_rules_by_cat[cid_str] = rule_map
-
-        new_rules_by_cat = {}
-        for cid_str, cat in new_ref_by_cat.items():
-            methods = cat.get("mapping_methods") or []
-            rule_map = {}
-            for m in methods:
-                sig = rule_signature(m)
-                if sig is None:
-                    continue
-                rule_map[sig] = m
-            new_rules_by_cat[cid_str] = rule_map
-
-        # Prepare final reference list
-        new_reference_list = list(new_ref_by_cat.values())
-        try:
-            new_reference_list.sort(
-                key=lambda c: str(c.get("pim_category_id") or "")
-            )
-        except Exception as e_sort:
-            log_warning(
-                logger,
-                f"STEP E: Could not sort new reference list by pim_category_id: {repr(e_sort)}",
-            )
-            print(
-                "DEBUG: STEP E – sorting new reference list failed; "
-                "continuing unsorted"
-            )
-
-        # New reference key
-        new_ref_key = f"canonical_mappings/Category_Mapping_Reference_{ts}.json"
-
-        # Write new reference file
-        current_step = "STEP E: Write new Category_Mapping_Reference"
-        log_info(logger, current_step)
-        body_ref = json.dumps(new_reference_list, indent=2, ensure_ascii=False)
+        new_reference_key = (
+            f"canonical_mappings/Category_Mapping_Reference_{timestamp_str}.json"
+        )
         log_info(
             logger,
-            f"STEP E: Writing new Category_Mapping_Reference to "
-            f"s3://{input_bucket}/{new_ref_key}",
+            "STEP E2: Writing updated Category_Mapping_Reference to "
+            f"s3://{INPUT_BUCKET}/{new_reference_key}",
         )
         print(
-            "DEBUG: STEP E – writing new Category_Mapping_Reference to: "
-            f"s3://{input_bucket}/{new_ref_key}"
-        )
-        s3_client.put_object(
-            Bucket=input_bucket,
-            Key=new_ref_key,
-            Body=body_ref.encode("utf-8"),
+            "STEP E2: Writing updated Category_Mapping_Reference to "
+            f"s3://{INPUT_BUCKET}/{new_reference_key}"
         )
 
-        # Compute change log (added / removed rules per category)
-        current_step = "STEP E: Compute and write rule change log"
-        log_info(logger, current_step)
-
-        changes = []
-        all_cids = set(old_rules_by_cat.keys()) | set(new_rules_by_cat.keys())
-        for cid_str in all_cids:
-            old_map = old_rules_by_cat.get(cid_str, {})
-            new_map = new_rules_by_cat.get(cid_str, {})
-            old_sigs = set(old_map.keys())
-            new_sigs = set(new_map.keys())
-            added_sigs = new_sigs - old_sigs
-            removed_sigs = old_sigs - new_sigs
-            if not added_sigs and not removed_sigs:
-                continue
-            cat_obj = new_ref_by_cat.get(cid_str) or ref_by_cat.get(cid_str) or {}
-            change_entry = {
-                "pim_category_id": cid_str,
-                "pim_category_name": cat_obj.get("pim_category_name"),
-                "added_rules": [new_map[s] for s in added_sigs],
-                "removed_rules": [old_map[s] for s in removed_sigs],
-            }
-            changes.append(change_entry)
-
-        change_log = {
-            "vendor_name": vendor_name,
-            "timestamp": ts,
-            "old_reference_key": latest_ref_key,
-            "new_reference_key": new_ref_key,
-            "changes": changes,
-        }
-
-        change_key = (
-            "canonical_mappings/"
-            f"Category_Mapping_RuleChanges_{vendor_name}_{ts}.json"
+        write_json_to_s3(
+            s3_client,
+            INPUT_BUCKET,
+            new_reference_key,
+            updated_reference_list,
+            indent=2,
+            logger=logger,
         )
 
-        body_change = json.dumps(change_log, indent=2, ensure_ascii=False)
+        change_log_key = (
+            f"canonical_mappings/Category_Mapping_Reference_changelog_{timestamp_str}.json"
+        )
         log_info(
             logger,
-            f"STEP E: Writing rule change log to s3://{input_bucket}/{change_key}",
+            "STEP E3: Writing Category_Mapping_Reference change log to "
+            f"s3://{INPUT_BUCKET}/{change_log_key}",
         )
         print(
-            "DEBUG: STEP E – writing rule change log to: "
-            f"s3://{input_bucket}/{change_key}"
-        )
-        s3_client.put_object(
-            Bucket=input_bucket,
-            Key=change_key,
-            Body=body_change.encode("utf-8"),
+            "STEP E3: Writing Category_Mapping_Reference change log to "
+            f"s3://{INPUT_BUCKET}/{change_log_key}"
         )
 
-        log_info(logger, "========== JOB END (SUCCESS) ==========")
-        print("DEBUG: JOB END – success path reached")
+        write_json_to_s3(
+            s3_client,
+            INPUT_BUCKET,
+            change_log_key,
+            change_log,
+            indent=2,
+            logger=logger,
+        )
+
+        log_info(logger, "JOB COMPLETED SUCCESSFULLY")
+        print("JOB COMPLETED SUCCESSFULLY")
+
         job.commit()
-        return
 
     except Exception as e:
         log_error(
             logger,
-            f"Job failed in logical step '{current_step}' with exception.",
+            f"FATAL: Job failed with exception in step: {current_step}\n{repr(e)}",
         )
-        log_error(logger, repr(e))
-        log_error(logger, traceback.format_exc())
-        print("FATAL: Job failed with exception in step:", current_step, repr(e))
-        traceback.print_exc()
+        print("FATAL: Job failed with exception in step:")
+        print(current_step)
+        print(repr(e))
         raise
 
 
