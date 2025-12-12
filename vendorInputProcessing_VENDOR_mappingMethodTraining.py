@@ -1353,6 +1353,9 @@ def main():
         for r in k2_candidates:
             try:
                 pim_category_id = r["pim_category_id"]
+                pim_category_id_norm = (
+                    str(pim_category_id) if pim_category_id is not None else None
+                )
                 keyword = r["keyword"]
                 keyword_lower = keyword.strip().lower()
 
@@ -1365,7 +1368,10 @@ def main():
                 inside_sets = []
                 outside_sets = []
                 for occ in occ_list:
-                    if occ["pim_category_id"] == pim_category_id:
+                    occ_pim_category_id_norm = (
+                        str(occ["pim_category_id"]) if occ["pim_category_id"] is not None else None
+                    )
+                    if occ_pim_category_id_norm == pim_category_id_norm:
                         inside_sets.append(occ["keywords_set_lower"])
                     else:
                         outside_sets.append(occ["keywords_set_lower"])
@@ -1407,7 +1413,10 @@ def main():
                     
                     # Count this occurrence
                     vendor_total_k2 += 1
-                    if vocc["pim_category_id"] == pim_category_id:
+                    vocc_pim_category_id_norm = (
+                        str(vocc["pim_category_id"]) if vocc["pim_category_id"] is not None else None
+                    )
+                    if vocc_pim_category_id_norm == pim_category_id_norm:
                         vendor_inside_k2 += 1
                     else:
                         vendor_outside_k2 += 1
