@@ -38,6 +38,7 @@
 import sys
 import json
 import traceback
+import os
 from datetime import datetime, timezone
 
 import boto3
@@ -836,47 +837,55 @@ def main():
         if previous_training_records:
             current_step = "STEP D1: Prepare previous training KEYWORD pairs"
             log_info(logger, current_step)
-            print(
-                "DEBUG: STEP D1 – building previous training KEYWORD pairs "
-                "from previous_training_records"
-            )
+            print("DEBUG: STEP D1 – building previous training KEYWORD pairs from previous_training_records")
+
             try:
-                df_prev_train = glue_context.spark_session.createDataFrame(
-                    [Row(**r) for r in previous_training_records]
-                )
+                # Build a minimal, flat list of (pim_category_id, keyword) rows in Python to avoid
+                # Spark schema inference issues on nested record structures.
+                prev_kw_rows = []
+                for rec in previous_training_records:
+                    if not isinstance(rec, dict):
+                        continue
+                    pim_category_id = rec.get("pim_category_id")
+                    raw_keywords = rec.get("keywords") or []
+                    if raw_keywords is None:
+                        continue
+                    # Ensure keywords is iterable
+                    if not isinstance(raw_keywords, list):
+                        raw_keywords = [raw_keywords]
+                    for kw in raw_keywords:
+                        if kw is None:
+                            continue
+                        kw_str = str(kw).strip()
+                        if not kw_str:
+                            continue
+                        prev_kw_rows.append({
+                            "pim_category_id": str(pim_category_id) if pim_category_id is not None else None,
+                            "keyword": kw_str,
+                        })
+
+                if prev_kw_rows:
+                    prev_schema = StructType([
+                        StructField("pim_category_id", StringType(), True),
+                        StructField("keyword", StringType(), True),
+                    ])
+                    df_prev_kw = glue_context.spark_session.createDataFrame(prev_kw_rows, schema=prev_schema)
+                    # Deduplicate to match previous behavior
+                    df_prev_kw = df_prev_kw.dropDuplicates(["pim_category_id", "keyword"])
+                    log_info(logger, f"STEP D1: Built previous keyword pairs DataFrame with {df_prev_kw.count()} rows")
+                    print(f"DEBUG: STEP D1 – previous keyword pairs count: {df_prev_kw.count()}")
+                else:
+                    df_prev_kw = glue_context.spark_session.createDataFrame([], schema="pim_category_id string, keyword string")
+                    log_info(logger, "STEP D1: No previous keyword pairs found in previous_training_records")
+                    print("DEBUG: STEP D1 – no previous keyword pairs found in previous_training_records")
+
             except Exception as e_prev:
-                log_warning(
-                    logger,
-                    "STEP D1: Could not create DataFrame from previous_training_records. "
-                    "New rule detection will treat all candidates as 'existing'.",
-                )
-                print(
-                    "DEBUG: STEP D1 – DataFrame creation from previous_training_records "
-                    "failed; proceeding without previous training info"
-                )
-                df_prev_kw = glue_context.spark_session.createDataFrame(
-                    [], schema="pim_category_id string, keyword string"
-                )
-            else:
-                for col_name in ["pim_category_id", "keywords"]:
-                    if col_name not in df_prev_train.columns:
-                        df_prev_train = df_prev_train.withColumn(col_name, F.lit(None))
-                df_prev_kw = (
-                    df_prev_train
-                    .select(
-                        F.col("pim_category_id").alias("pim_category_id"),
-                        F.explode_outer("keywords").alias("keyword"),
-                    )
-                    .where(
-                        F.col("keyword").isNotNull()
-                        & (F.trim(F.col("keyword")) != F.lit(""))
-                    )
-                    .dropDuplicates(["pim_category_id", "keyword"])
-                )
+                # Log the actual exception and fall back to empty DataFrame (preserve existing behavior)
+                log_warning(logger, f"STEP D1: Could not build previous-training keyword pairs; proceeding without previous training info. Exception: {repr(e_prev)}")
+                print("DEBUG: STEP D1 – DataFrame creation from previous_training_records failed; proceeding without previous training info")
+                df_prev_kw = glue_context.spark_session.createDataFrame([], schema="pim_category_id string, keyword string")
         else:
-            df_prev_kw = glue_context.spark_session.createDataFrame(
-                [], schema="pim_category_id string, keyword string"
-            )
+            df_prev_kw = glue_context.spark_session.createDataFrame([], schema="pim_category_id string, keyword string")
 
         # ---------- STEP D2: Explode KEYWORD terms from training subset ----------
         current_step = "STEP D2: Explode KEYWORD terms from training subset"
@@ -1523,64 +1532,55 @@ def main():
                 "continuing unsorted"
             )
 
-        # Pre-write validation: fail fast if Category_Mapping_Reference would be empty
-        record_count = len(new_reference_list)
-        log_info(
-            logger,
-            f"Category_Mapping_Reference record_count={record_count}",
-        )
-        print(f"DEBUG: STEP E – Category_Mapping_Reference record_count={record_count}")
+        # Compute record count robustly
+        canonical_mappings_prefix = "canonical_mappings"
+        timestamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+        
+        # Determine record count based on object type
+        try:
+            # Check if it's a Spark DataFrame
+            if hasattr(new_reference_list, 'count') and callable(getattr(new_reference_list, 'count')):
+                record_count = new_reference_list.count()
+            # Check if it's a pandas DataFrame
+            elif hasattr(new_reference_list, 'iloc'):
+                record_count = len(new_reference_list)
+            # Check if it's a list
+            elif isinstance(new_reference_list, list):
+                record_count = len(new_reference_list)
+            # Otherwise try len()
+            else:
+                try:
+                    record_count = len(new_reference_list)
+                except (TypeError, AttributeError):
+                    record_count = 1
+        except Exception:
+            record_count = 1
+        
+        log_info(logger, f"Category_Mapping_Reference record_count={record_count}")
         
         if record_count == 0:
-            log_error(
-                logger,
-                "Aborting: Category_Mapping_Reference would be empty (record_count=0). Failing fast.",
-            )
-            print("DEBUG: STEP E – Category_Mapping_Reference is empty; aborting job")
-            raise RuntimeError(
-                "Category_Mapping_Reference empty after processing - aborting job"
-            )
-
-        # Prepare S3 keys: canonical (stable name for backwards compat) and archival (timestamped)
-        # IMPORTANT: Canonical filenames must remain stable for downstream consumer compatibility.
-        canonical_mappings_prefix = "canonical_mappings"
-        reference_canonical_key = f"{canonical_mappings_prefix}/Category_Mapping_Reference.json"
-        reference_archive_key = f"{canonical_mappings_prefix}/Category_Mapping_Reference_{ts}.json"
+            log_error(logger, "Category_Mapping_Reference has 0 records; cannot write empty reference file")
+            raise RuntimeError("Category_Mapping_Reference has 0 records")
+        
+        # New reference key (timestamped only, no stable version)
+        new_ref_key = os.path.join(canonical_mappings_prefix, f"Category_Mapping_Reference_{timestamp}.json")
 
         # Write new reference file
         current_step = "STEP E: Write new Category_Mapping_Reference"
         log_info(logger, current_step)
         body_ref = json.dumps(new_reference_list, indent=2, ensure_ascii=False)
-        
-        # Write canonical file (stable filename for downstream consumers)
         log_info(
             logger,
-            f"STEP E: Writing canonical Category_Mapping_Reference to "
-            f"s3://{input_bucket}/{reference_canonical_key}",
+            f"STEP E: Writing new Category_Mapping_Reference to "
+            f"s3://{input_bucket}/{new_ref_key}",
         )
         print(
-            "DEBUG: STEP E – writing canonical Category_Mapping_Reference to: "
-            f"s3://{input_bucket}/{reference_canonical_key}"
+            "DEBUG: STEP E – writing new Category_Mapping_Reference to: "
+            f"s3://{input_bucket}/{new_ref_key}"
         )
         s3_client.put_object(
             Bucket=input_bucket,
-            Key=reference_canonical_key,
-            Body=body_ref.encode("utf-8"),
-        )
-        
-        # Write archival copy (timestamped for historical tracking)
-        log_info(
-            logger,
-            f"STEP E: Writing archival Category_Mapping_Reference to "
-            f"s3://{input_bucket}/{reference_archive_key}",
-        )
-        print(
-            "DEBUG: STEP E – writing archival Category_Mapping_Reference to: "
-            f"s3://{input_bucket}/{reference_archive_key}"
-        )
-        s3_client.put_object(
-            Bucket=input_bucket,
-            Key=reference_archive_key,
+            Key=new_ref_key,
             Body=body_ref.encode("utf-8"),
         )
 
@@ -1610,51 +1610,110 @@ def main():
 
         change_log = {
             "vendor_name": vendor_name,
-            "timestamp": ts,
+            "timestamp": timestamp,
             "old_reference_key": latest_ref_key,
-            "new_reference_key": reference_canonical_key,
+            "new_reference_key": new_ref_key,
             "changes": changes,
         }
 
-        # Prepare changelog S3 keys: canonical (stable) and archival (timestamped)
-        # IMPORTANT: Canonical changelog filename must remain stable for downstream consumer compatibility.
-        changelog_canonical_key = f"{canonical_mappings_prefix}/Category_Mapping_Reference_changelog.json"
-        changelog_archive_key = (
-            f"{canonical_mappings_prefix}/"
-            f"Category_Mapping_RuleChanges_{vendor_name}_{ts}.json"
+        change_key = (
+            "canonical_mappings/"
+            f"Category_Mapping_RuleChanges_{vendor_name}_{timestamp}.json"
         )
 
         body_change = json.dumps(change_log, indent=2, ensure_ascii=False)
-        
-        # Write canonical changelog (stable filename for downstream consumers)
         log_info(
             logger,
-            f"STEP E: Writing canonical rule change log to s3://{input_bucket}/{changelog_canonical_key}",
+            f"STEP E: Writing rule change log to s3://{input_bucket}/{change_key}",
         )
         print(
-            "DEBUG: STEP E – writing canonical rule change log to: "
-            f"s3://{input_bucket}/{changelog_canonical_key}"
+            "DEBUG: STEP E – writing rule change log to: "
+            f"s3://{input_bucket}/{change_key}"
         )
         s3_client.put_object(
             Bucket=input_bucket,
-            Key=changelog_canonical_key,
+            Key=change_key,
             Body=body_change.encode("utf-8"),
+        )
+
+        # =========================================================
+        # STEP E: Write Category_Mapping_StableTrainingDataset.json if not exists
+        # =========================================================
+        current_step = "STEP E: Write Category_Mapping_StableTrainingDataset.json if not exists"
+        stable_training_dataset_key = os.path.join(
+            canonical_mappings_prefix,
+            "Category_Mapping_StableTrainingDataset.json"
         )
         
-        # Write archival changelog (timestamped for historical tracking)
-        log_info(
-            logger,
-            f"STEP E: Writing archival rule change log to s3://{input_bucket}/{changelog_archive_key}",
-        )
-        print(
-            "DEBUG: STEP E – writing archival rule change log to: "
-            f"s3://{input_bucket}/{changelog_archive_key}"
-        )
-        s3_client.put_object(
-            Bucket=input_bucket,
-            Key=changelog_archive_key,
-            Body=body_change.encode("utf-8"),
-        )
+        # Check if the stable training dataset already exists
+        stable_dataset_exists = False
+        try:
+            s3_client.head_object(Bucket=input_bucket, Key=stable_training_dataset_key)
+            stable_dataset_exists = True
+            log_info(
+                logger,
+                f"Stable training dataset already exists at s3://{input_bucket}/{stable_training_dataset_key}"
+            )
+            print(
+                f"DEBUG: STEP E – stable training dataset already exists at: "
+                f"s3://{input_bucket}/{stable_training_dataset_key}"
+            )
+        except ClientError as ce:
+            # If the error is 404 (Not Found), the object doesn't exist
+            error_code = ce.response.get('Error', {}).get('Code', '')
+            if error_code in ('404', 'NoSuchKey'):
+                stable_dataset_exists = False
+                log_info(
+                    logger,
+                    f"Stable training dataset does not exist at s3://{input_bucket}/{stable_training_dataset_key}; will create it"
+                )
+                print(
+                    f"DEBUG: STEP E – stable training dataset does not exist; will create it"
+                )
+            else:
+                # Other errors should be logged but not fail the job
+                log_warning(
+                    logger,
+                    f"Error checking existence of stable training dataset: {repr(ce)}"
+                )
+                print(
+                    f"DEBUG: STEP E – error checking stable dataset existence: {repr(ce)}"
+                )
+        except Exception as e_head:
+            # Other exceptions should be logged but not fail the job
+            log_warning(
+                logger,
+                f"Unexpected error checking existence of stable training dataset: {repr(e_head)}"
+            )
+            print(
+                f"DEBUG: STEP E – unexpected error checking stable dataset existence: {repr(e_head)}"
+            )
+        
+        # Write the stable training dataset if it doesn't exist
+        if not stable_dataset_exists:
+            try:
+                stable_dataset_body = json.dumps(final_records, indent=2, ensure_ascii=False)
+                s3_client.put_object(
+                    Bucket=input_bucket,
+                    Key=stable_training_dataset_key,
+                    Body=stable_dataset_body.encode("utf-8"),
+                )
+                log_info(
+                    logger,
+                    f"STEP E: Stable training dataset written to s3://{input_bucket}/{stable_training_dataset_key}"
+                )
+                print(
+                    f"DEBUG: STEP E – stable training dataset written to: "
+                    f"s3://{input_bucket}/{stable_training_dataset_key}"
+                )
+            except Exception as e_write:
+                log_warning(
+                    logger,
+                    f"Error writing stable training dataset: {repr(e_write)}"
+                )
+                print(
+                    f"DEBUG: STEP E – error writing stable training dataset: {repr(e_write)}"
+                )
 
         log_info(logger, "========== JOB END (SUCCESS) ==========")
         print("DEBUG: JOB END – success path reached")
