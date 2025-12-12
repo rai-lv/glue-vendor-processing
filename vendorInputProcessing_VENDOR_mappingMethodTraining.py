@@ -36,6 +36,7 @@
 #           Category_Mapping_RuleChanges_<vendor_name>_<timestamp>.json
 
 import sys
+import os
 import json
 import traceback
 from datetime import datetime, timezone
@@ -581,17 +582,35 @@ def main():
         # =========================================================
         current_step = "STEP B4: Write back Stable Training Dataset"
         log_info(logger, current_step)
-        print("DEBUG: STEP B4 – writing Stable Training Dataset to S3")
+        print("DEBUG: STEP B4 – checking if Stable Training Dataset exists")
 
-        stable_body = json.dumps(final_records, indent=2, ensure_ascii=False)
-        s3_client.put_object(
-            Bucket=input_bucket,
-            Key=stable_key,
-            Body=stable_body.encode("utf-8"),
-        )
+        # Check if Category_Mapping_StableTrainingDataset.json already exists
+        stable_exists = False
+        try:
+            s3_client.head_object(Bucket=input_bucket, Key=stable_key)
+            stable_exists = True
+        except ClientError as ce:
+            if ce.response["Error"]["Code"] in ("404", "NoSuchKey"):
+                stable_exists = False
+            else:
+                raise
 
-        log_info(logger, "STEP B4: Stable Training Dataset successfully updated.")
-        print("DEBUG: STEP B4 – Stable Training Dataset write completed")
+        if stable_exists:
+            log_info(
+                logger,
+                "STEP B4: Category_Mapping_StableTrainingDataset.json already exists; skipping write."
+            )
+            print("DEBUG: STEP B4 – Stable Training Dataset already exists; skipping write")
+        else:
+            print("DEBUG: STEP B4 – writing Stable Training Dataset to S3")
+            stable_body = json.dumps(final_records, indent=2, ensure_ascii=False)
+            s3_client.put_object(
+                Bucket=input_bucket,
+                Key=stable_key,
+                Body=stable_body.encode("utf-8"),
+            )
+            log_info(logger, "STEP B4: Stable Training Dataset successfully created.")
+            print("DEBUG: STEP B4 – Stable Training Dataset write completed")
 
         # =========================================================
         # STEP C: Derive training subset with min product threshold
@@ -1257,10 +1276,10 @@ def main():
         current_step = "STEP D6: Write rule proposals JSON to S3"
         log_info(logger, current_step)
 
-        ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        timestamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
         rule_key = (
             "canonical_mappings/"
-            f"Category_Mapping_RuleProposals_{vendor_name}_{ts}.json"
+            f"Category_Mapping_RuleProposals_{vendor_name}_{timestamp}.json"
         )
 
         body_rules = json.dumps(rule_proposals, indent=2, ensure_ascii=False)
@@ -1522,8 +1541,29 @@ def main():
                 "continuing unsorted"
             )
 
-        # Pre-write validation: fail fast if Category_Mapping_Reference would be empty
-        record_count = len(new_reference_list)
+        # Pre-write validation: compute record_count robustly
+        # If Spark DataFrame use df.count(), elif pandas DataFrame use len(df), 
+        # elif list use len(list), else attempt len(obj) and fall back to 1
+        try:
+            # Check if it's a Spark DataFrame
+            if hasattr(new_reference_list, 'count') and callable(getattr(new_reference_list, 'count', None)) and hasattr(new_reference_list, 'rdd'):
+                record_count = new_reference_list.count()
+            # Check if it's a pandas DataFrame
+            elif hasattr(new_reference_list, 'shape'):
+                record_count = len(new_reference_list)
+            # Check if it's a list
+            elif isinstance(new_reference_list, list):
+                record_count = len(new_reference_list)
+            else:
+                # Attempt len(obj), fall back to 1
+                try:
+                    record_count = len(new_reference_list)
+                except:
+                    record_count = 1
+        except Exception as e_count:
+            log_warning(logger, f"Failed to compute record_count, falling back to 1: {repr(e_count)}")
+            record_count = 1
+        
         log_info(
             logger,
             f"Category_Mapping_Reference record_count={record_count}",
@@ -1540,46 +1580,27 @@ def main():
                 "Category_Mapping_Reference empty after processing - aborting job"
             )
 
-        # Prepare S3 keys: canonical (stable name for backwards compat) and archival (timestamped)
-        # IMPORTANT: Canonical filenames must remain stable for downstream consumer compatibility.
+        # Prepare S3 key for timestamped Category_Mapping_Reference (canonical for this run)
         canonical_mappings_prefix = "canonical_mappings"
-        reference_canonical_key = f"{canonical_mappings_prefix}/Category_Mapping_Reference.json"
-        reference_archive_key = f"{canonical_mappings_prefix}/Category_Mapping_Reference_{ts}.json"
+        reference_key = os.path.join(canonical_mappings_prefix, f"Category_Mapping_Reference_{timestamp}.json")
 
-        # Write new reference file
+        # Write new reference file (timestamped, canonical for this run)
         current_step = "STEP E: Write new Category_Mapping_Reference"
         log_info(logger, current_step)
         body_ref = json.dumps(new_reference_list, indent=2, ensure_ascii=False)
         
-        # Write canonical file (stable filename for downstream consumers)
         log_info(
             logger,
-            f"STEP E: Writing canonical Category_Mapping_Reference to "
-            f"s3://{input_bucket}/{reference_canonical_key}",
+            f"STEP E: Writing Category_Mapping_Reference to "
+            f"s3://{input_bucket}/{reference_key}",
         )
         print(
-            "DEBUG: STEP E – writing canonical Category_Mapping_Reference to: "
-            f"s3://{input_bucket}/{reference_canonical_key}"
+            "DEBUG: STEP E – writing Category_Mapping_Reference to: "
+            f"s3://{input_bucket}/{reference_key}"
         )
         s3_client.put_object(
             Bucket=input_bucket,
-            Key=reference_canonical_key,
-            Body=body_ref.encode("utf-8"),
-        )
-        
-        # Write archival copy (timestamped for historical tracking)
-        log_info(
-            logger,
-            f"STEP E: Writing archival Category_Mapping_Reference to "
-            f"s3://{input_bucket}/{reference_archive_key}",
-        )
-        print(
-            "DEBUG: STEP E – writing archival Category_Mapping_Reference to: "
-            f"s3://{input_bucket}/{reference_archive_key}"
-        )
-        s3_client.put_object(
-            Bucket=input_bucket,
-            Key=reference_archive_key,
+            Key=reference_key,
             Body=body_ref.encode("utf-8"),
         )
 
@@ -1609,49 +1630,32 @@ def main():
 
         change_log = {
             "vendor_name": vendor_name,
-            "timestamp": ts,
+            "timestamp": timestamp,
             "old_reference_key": latest_ref_key,
-            "new_reference_key": reference_canonical_key,
+            "new_reference_key": reference_key,
             "changes": changes,
         }
 
-        # Prepare changelog S3 keys: canonical (stable) and archival (timestamped)
-        # IMPORTANT: Canonical changelog filename must remain stable for downstream consumer compatibility.
-        changelog_canonical_key = f"{canonical_mappings_prefix}/Category_Mapping_Reference_changelog.json"
-        changelog_archive_key = (
+        # Prepare changelog S3 key (timestamped)
+        changelog_key = (
             f"{canonical_mappings_prefix}/"
-            f"Category_Mapping_RuleChanges_{vendor_name}_{ts}.json"
+            f"Category_Mapping_RuleChanges_{vendor_name}_{timestamp}.json"
         )
 
         body_change = json.dumps(change_log, indent=2, ensure_ascii=False)
         
-        # Write canonical changelog (stable filename for downstream consumers)
+        # Write changelog (timestamped for historical tracking)
         log_info(
             logger,
-            f"STEP E: Writing canonical rule change log to s3://{input_bucket}/{changelog_canonical_key}",
+            f"STEP E: Writing rule change log to s3://{input_bucket}/{changelog_key}",
         )
         print(
-            "DEBUG: STEP E – writing canonical rule change log to: "
-            f"s3://{input_bucket}/{changelog_canonical_key}"
+            "DEBUG: STEP E – writing rule change log to: "
+            f"s3://{input_bucket}/{changelog_key}"
         )
         s3_client.put_object(
             Bucket=input_bucket,
-            Key=changelog_canonical_key,
-            Body=body_change.encode("utf-8"),
-        )
-        
-        # Write archival changelog (timestamped for historical tracking)
-        log_info(
-            logger,
-            f"STEP E: Writing archival rule change log to s3://{input_bucket}/{changelog_archive_key}",
-        )
-        print(
-            "DEBUG: STEP E – writing archival rule change log to: "
-            f"s3://{input_bucket}/{changelog_archive_key}"
-        )
-        s3_client.put_object(
-            Bucket=input_bucket,
-            Key=changelog_archive_key,
+            Key=changelog_key,
             Body=body_change.encode("utf-8"),
         )
 
