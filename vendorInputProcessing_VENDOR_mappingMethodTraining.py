@@ -36,7 +36,6 @@
 #           Category_Mapping_RuleChanges_<vendor_name>_<timestamp>.json
 
 import sys
-import os
 import json
 import traceback
 from datetime import datetime, timezone
@@ -1558,7 +1557,7 @@ def main():
                 # Attempt len(obj), fall back to 1
                 try:
                     record_count = len(new_reference_list)
-                except:
+                except (TypeError, AttributeError):
                     record_count = 1
         except Exception as e_count:
             log_warning(logger, f"Failed to compute record_count, falling back to 1: {repr(e_count)}")
@@ -1582,7 +1581,7 @@ def main():
 
         # Prepare S3 key for timestamped Category_Mapping_Reference (canonical for this run)
         canonical_mappings_prefix = "canonical_mappings"
-        reference_key = os.path.join(canonical_mappings_prefix, f"Category_Mapping_Reference_{timestamp}.json")
+        reference_key = f"{canonical_mappings_prefix}/Category_Mapping_Reference_{timestamp}.json"
 
         # Write new reference file (timestamped, canonical for this run)
         current_step = "STEP E: Write new Category_Mapping_Reference"
