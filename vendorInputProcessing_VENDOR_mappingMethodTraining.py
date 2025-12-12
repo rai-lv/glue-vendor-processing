@@ -836,47 +836,55 @@ def main():
         if previous_training_records:
             current_step = "STEP D1: Prepare previous training KEYWORD pairs"
             log_info(logger, current_step)
-            print(
-                "DEBUG: STEP D1 – building previous training KEYWORD pairs "
-                "from previous_training_records"
-            )
+            print("DEBUG: STEP D1 – building previous training KEYWORD pairs from previous_training_records")
+
             try:
-                df_prev_train = glue_context.spark_session.createDataFrame(
-                    [Row(**r) for r in previous_training_records]
-                )
+                # Build a minimal, flat list of (pim_category_id, keyword) rows in Python to avoid
+                # Spark schema inference issues on nested record structures.
+                prev_kw_rows = []
+                for rec in previous_training_records:
+                    if not isinstance(rec, dict):
+                        continue
+                    pim_category_id = rec.get("pim_category_id")
+                    raw_keywords = rec.get("keywords") or []
+                    if raw_keywords is None:
+                        continue
+                    # Ensure keywords is iterable
+                    if not isinstance(raw_keywords, list):
+                        raw_keywords = [raw_keywords]
+                    for kw in raw_keywords:
+                        if kw is None:
+                            continue
+                        kw_str = str(kw).strip()
+                        if not kw_str:
+                            continue
+                        prev_kw_rows.append({
+                            "pim_category_id": str(pim_category_id) if pim_category_id is not None else None,
+                            "keyword": kw_str,
+                        })
+
+                if prev_kw_rows:
+                    prev_schema = StructType([
+                        StructField("pim_category_id", StringType(), True),
+                        StructField("keyword", StringType(), True),
+                    ])
+                    df_prev_kw = glue_context.spark_session.createDataFrame(prev_kw_rows, schema=prev_schema)
+                    # Deduplicate to match previous behavior
+                    df_prev_kw = df_prev_kw.dropDuplicates(["pim_category_id", "keyword"])
+                    log_info(logger, f"STEP D1: Built previous keyword pairs DataFrame with {df_prev_kw.count()} rows")
+                    print(f"DEBUG: STEP D1 – previous keyword pairs count: {df_prev_kw.count()}")
+                else:
+                    df_prev_kw = glue_context.spark_session.createDataFrame([], schema="pim_category_id string, keyword string")
+                    log_info(logger, "STEP D1: No previous keyword pairs found in previous_training_records")
+                    print("DEBUG: STEP D1 – no previous keyword pairs found in previous_training_records")
+
             except Exception as e_prev:
-                log_warning(
-                    logger,
-                    "STEP D1: Could not create DataFrame from previous_training_records. "
-                    "New rule detection will treat all candidates as 'existing'.",
-                )
-                print(
-                    "DEBUG: STEP D1 – DataFrame creation from previous_training_records "
-                    "failed; proceeding without previous training info"
-                )
-                df_prev_kw = glue_context.spark_session.createDataFrame(
-                    [], schema="pim_category_id string, keyword string"
-                )
-            else:
-                for col_name in ["pim_category_id", "keywords"]:
-                    if col_name not in df_prev_train.columns:
-                        df_prev_train = df_prev_train.withColumn(col_name, F.lit(None))
-                df_prev_kw = (
-                    df_prev_train
-                    .select(
-                        F.col("pim_category_id").alias("pim_category_id"),
-                        F.explode_outer("keywords").alias("keyword"),
-                    )
-                    .where(
-                        F.col("keyword").isNotNull()
-                        & (F.trim(F.col("keyword")) != F.lit(""))
-                    )
-                    .dropDuplicates(["pim_category_id", "keyword"])
-                )
+                # Log the actual exception and fall back to empty DataFrame (preserve existing behavior)
+                log_warning(logger, f"STEP D1: Could not build previous-training keyword pairs; proceeding without previous training info. Exception: {repr(e_prev)}")
+                print("DEBUG: STEP D1 – DataFrame creation from previous_training_records failed; proceeding without previous training info")
+                df_prev_kw = glue_context.spark_session.createDataFrame([], schema="pim_category_id string, keyword string")
         else:
-            df_prev_kw = glue_context.spark_session.createDataFrame(
-                [], schema="pim_category_id string, keyword string"
-            )
+            df_prev_kw = glue_context.spark_session.createDataFrame([], schema="pim_category_id string, keyword string")
 
         # ---------- STEP D2: Explode KEYWORD terms from training subset ----------
         current_step = "STEP D2: Explode KEYWORD terms from training subset"
