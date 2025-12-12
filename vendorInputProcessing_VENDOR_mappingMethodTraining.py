@@ -139,13 +139,14 @@ def normalize_training_record(rec: dict) -> dict:
     if raw_keywords is None:
         keywords = []
     elif isinstance(raw_keywords, list):
+        # Trim whitespace from each keyword so training-side keywords match vendor-side trimming
         keywords = [
-            str(k) for k in raw_keywords
+            str(k).strip() for k in raw_keywords
             if k is not None and str(k).strip() != ""
         ]
     else:
-        kw_str = str(raw_keywords)
-        keywords = [kw_str] if kw_str.strip() != "" else []
+        kw_str = str(raw_keywords).strip()
+        keywords = [kw_str] if kw_str != "" else []
     out["keywords"] = keywords
 
     # Normalise class_codes: always a list of {system, code}
