@@ -1542,7 +1542,7 @@ def main():
             else:
                 try:
                     record_count = len(new_reference_list)
-                except:
+                except (TypeError, AttributeError):
                     record_count = 1
         except Exception:
             record_count = 1
@@ -1652,7 +1652,7 @@ def main():
         except ClientError as ce:
             # If the error is 404 (Not Found), the object doesn't exist
             error_code = ce.response.get('Error', {}).get('Code', '')
-            if error_code == '404':
+            if error_code in ('404', 'NoSuchKey'):
                 stable_dataset_exists = False
                 log_info(
                     logger,
