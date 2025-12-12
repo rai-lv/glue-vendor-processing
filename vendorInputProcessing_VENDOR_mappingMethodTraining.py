@@ -1261,7 +1261,9 @@ def main():
         # Step 1: Build training_kw_occurrences (case-insensitive)
         training_kw_occurrences = {}
         for rec in training_records:
-            pim_category_id = rec.get("pim_category_id")
+            pim_category_id_raw = rec.get("pim_category_id")
+            # Normalize pim_category_id to string for consistent comparisons
+            pim_category_id = str(pim_category_id_raw) if pim_category_id_raw is not None else None
             raw_keywords = rec.get("keywords") or []
             if not isinstance(raw_keywords, list):
                 continue
@@ -1298,7 +1300,9 @@ def main():
             for m in pim_matches:
                 if not isinstance(m, dict):
                     continue
-                pim_category_id = m.get("pim_category_id")
+                pim_category_id_raw = m.get("pim_category_id")
+                # Normalize pim_category_id to string for consistent comparisons
+                pim_category_id = str(pim_category_id_raw) if pim_category_id_raw is not None else None
                 products = m.get("products") or []
                 if not isinstance(products, list):
                     continue
