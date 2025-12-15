@@ -37,6 +37,7 @@
 
 import sys
 import json
+import re
 import traceback
 import os
 from datetime import datetime, timezone
@@ -1268,6 +1269,23 @@ def main():
         log_info(logger, current_step)
         print("DEBUG: STEP K2 – starting K2 rule generation")
 
+        def _is_meaningful_token(tok: str) -> bool:
+            if not tok:
+                return False
+            # require length >= 4
+            if len(tok) < 4:
+                return False
+            # require at least one letter (Unicode-aware)
+            if not any(ch.isalpha() for ch in tok):
+                return False
+            # reject pure-digit tokens
+            if re.fullmatch(r'[0-9]+', tok):
+                return False
+            # reject digit-only tokens with separators (likely article numbers)
+            if re.fullmatch(r'[0-9\.\-_/]+', tok):
+                return False
+            return True
+
         # Step 1: Build training_kw_occurrences (case-insensitive)
         training_kw_occurrences = {}
         for rec in training_records:
@@ -1397,8 +1415,10 @@ def main():
 
                 # Compute exclude_candidates (only tokens appearing outside but not inside)
                 exclude_candidates_raw = outside_tokens - inside_tokens
+                # lexical filter: keep only meaningful tokens (letters, len>=4, not numeric codes)
+                exclude_candidates_raw = {tok for tok in exclude_candidates_raw if _is_meaningful_token(tok)}
                 if not exclude_candidates_raw:
-                    # Skip if no exclude candidates exist (keyword only appears inside target category)
+                    # nothing meaningful to exclude -> skip K2 candidate
                     continue
 
                 # Apply MIN_K2_EXCLUDE_SUPPORT: filter exclude candidates by support count
