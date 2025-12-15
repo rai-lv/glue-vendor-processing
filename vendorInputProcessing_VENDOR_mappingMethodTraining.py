@@ -1398,6 +1398,7 @@ def main():
                 # Compute exclude_candidates (only tokens appearing outside but not inside)
                 exclude_candidates_raw = outside_tokens - inside_tokens
                 if not exclude_candidates_raw:
+                    # Skip if no exclude candidates exist (keyword only appears inside target category)
                     continue
 
                 # Apply MIN_K2_EXCLUDE_SUPPORT: filter exclude candidates by support count
