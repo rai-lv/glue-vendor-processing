@@ -1426,7 +1426,8 @@ def main():
                     )
                     exclude_candidates = set(sorted_candidates[:MAX_K2_EXCLUDES_PER_RULE])
 
-                # Validate coverage: check if exclude list covers sufficient outside occurrences
+                # Validate coverage: require that exclude_candidates cover at least
+                # MIN_K2_OUTSIDE_COVERAGE_RATIO of outside occurrences
                 covered_outside_sets = sum(1 for s in outside_sets if s & exclude_candidates)
                 total_outside_sets = len(outside_sets)
                 
@@ -1434,15 +1435,8 @@ def main():
                     coverage_ratio = covered_outside_sets / total_outside_sets
                     if coverage_ratio < MIN_K2_OUTSIDE_COVERAGE_RATIO:
                         continue
-                
-                # Also ensure all outside sets are covered (stricter requirement)
-                coverage_ok = True
-                for s in outside_sets:
-                    if not (s & exclude_candidates):
-                        coverage_ok = False
-                        break
-                
-                if not coverage_ok:
+                else:
+                    # No outside sets to cover, skip this candidate
                     continue
 
                 # Compute vendor stats under K2 semantics
