@@ -734,6 +734,20 @@ def main():
         else:
             print("DEBUG: STEP C – training_records is empty list")
 
+        # Persist the filtered training subset for downstream jobs
+        current_step = "STEP C: Write training subset"
+        log_info(logger, current_step)
+        print(
+            "DEBUG: STEP C – writing training subset to S3 at: "
+            f"s3://{input_bucket}/{stable_training_key}"
+        )
+        training_body = json.dumps(training_records, indent=2, ensure_ascii=False)
+        s3_client.put_object(
+            Bucket=input_bucket,
+            Key=stable_training_key,
+            Body=training_body.encode("utf-8"),
+        )
+
         # =========================================================
         # STEP D: Prepare training subset for KEYWORD statistics
         # =========================================================
