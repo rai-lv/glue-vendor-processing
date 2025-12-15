@@ -1677,19 +1677,27 @@ def main():
         # Build rules_by_cat from rule_proposals, using accepted vendor_status
         accepted_statuses = {"new", "supported", "not_impacted"}
         rules_by_cat = {}
+        total_rule_count = len(rule_proposals)
+        accepted_rule_count = 0
+        skipped_status_count = 0
+        skipped_missing_category_count = 0
+        skipped_missing_values_count = 0
 
         for rule in rule_proposals:
             stats = rule.get("stats") or {}
             vendor_status = stats.get("vendor_status")
             if vendor_status not in accepted_statuses:
                 # skip violated or unknown
+                skipped_status_count += 1
                 continue
 
             pim_category_id = rule.get("pim_category_id")
             if pim_category_id is None:
+                skipped_missing_category_count += 1
                 continue
             cid_str = str(pim_category_id).strip()
             if not cid_str:
+                skipped_missing_category_count += 1
                 continue
 
             field_name = rule.get("field_name", "KEYWORD")
@@ -1703,6 +1711,7 @@ def main():
                 if v_str:
                     values_include.append(v_str)
             if not values_include:
+                skipped_missing_values_count += 1
                 continue
 
             raw_values_exclude = rule.get("values_exclude") or []
@@ -1722,6 +1731,23 @@ def main():
             }
 
             rules_by_cat.setdefault(cid_str, []).append(method_obj)
+            accepted_rule_count += 1
+
+        log_info(
+            logger,
+            "STEP E: Rule proposal filtering summary - "
+            f"total={total_rule_count}, accepted={accepted_rule_count}, "
+            f"skipped_by_status={skipped_status_count}, "
+            f"skipped_missing_category={skipped_missing_category_count}, "
+            f"skipped_missing_values={skipped_missing_values_count}",
+        )
+        print(
+            "DEBUG: STEP E – rule proposal filtering summary: "
+            f"total={total_rule_count}, accepted={accepted_rule_count}, "
+            f"skipped_by_status={skipped_status_count}, "
+            f"skipped_missing_category={skipped_missing_category_count}, "
+            f"skipped_missing_values={skipped_missing_values_count}"
+        )
 
         # Ensure new categories from rules exist in new_ref_by_cat
         for cid_str, methods in rules_by_cat.items():
