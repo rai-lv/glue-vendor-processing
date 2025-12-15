@@ -1705,10 +1705,19 @@ def main():
             if not values_include:
                 continue
 
+            raw_values_exclude = rule.get("values_exclude") or []
+            values_exclude = []
+            for v in raw_values_exclude:
+                if v is None:
+                    continue
+                v_str = str(v).strip()
+                if v_str:
+                    values_exclude.append(v_str)
+
             method_obj = {
                 "field_name": field_name,
                 "values_include": values_include,
-                "values_exclude": [],
+                "values_exclude": values_exclude,
                 "operator": operator,
             }
 
