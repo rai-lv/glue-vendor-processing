@@ -204,6 +204,31 @@ def normalize_training_record(rec: dict) -> dict:
     return out
 
 
+def _normalize_token(tok: str) -> str:
+    """
+    Apply simple stemming to normalize singular/plural forms.
+    Removes common German plural suffixes to treat variants as equal.
+    """
+    if not tok or len(tok) < 5:
+        return tok
+    
+    # Common German plural patterns (apply most specific first)
+    # Remove -en suffix (e.g., maschinen -> maschin, frauen -> frau)
+    if tok.endswith('en') and len(tok) > 5:
+        return tok[:-2]
+    # Remove -n suffix for words not ending in -en
+    elif tok.endswith('n') and len(tok) > 5:
+        return tok[:-1]
+    # Remove -e suffix (e.g., maschine -> maschin, tage -> tag)
+    elif tok.endswith('e') and len(tok) > 5:
+        return tok[:-1]
+    # Remove -s suffix (e.g., autos -> auto)
+    elif tok.endswith('s') and len(tok) > 4:
+        return tok[:-1]
+    
+    return tok
+
+
 def main():
     phase = "STARTUP"
     logger = None
@@ -1299,30 +1324,6 @@ def main():
             if re.fullmatch(r'[0-9\.\-_/]+', tok):
                 return False
             return True
-
-        def _normalize_token(tok: str) -> str:
-            """
-            Apply simple stemming to normalize singular/plural forms.
-            Removes common German plural suffixes to treat variants as equal.
-            """
-            if not tok or len(tok) < 5:
-                return tok
-            
-            # Common German plural patterns (apply most specific first)
-            # Remove -en suffix (e.g., maschinen -> maschin, frauen -> frau)
-            if tok.endswith('en') and len(tok) > 5:
-                return tok[:-2]
-            # Remove -n suffix for words not ending in -en
-            elif tok.endswith('n') and len(tok) > 5:
-                return tok[:-1]
-            # Remove -e suffix (e.g., maschine -> maschin, tage -> tag)
-            elif tok.endswith('e') and len(tok) > 5:
-                return tok[:-1]
-            # Remove -s suffix (e.g., autos -> auto)
-            elif tok.endswith('s') and len(tok) > 4:
-                return tok[:-1]
-            
-            return tok
 
         # Step 1: Build training_kw_occurrences (case-insensitive)
         training_kw_occurrences = {}
