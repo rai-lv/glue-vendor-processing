@@ -1300,6 +1300,30 @@ def main():
                 return False
             return True
 
+        def _normalize_token(tok: str) -> str:
+            """
+            Apply simple stemming to normalize singular/plural forms.
+            Removes common German plural suffixes to treat variants as equal.
+            """
+            if not tok or len(tok) < 5:
+                return tok
+            
+            # Common German plural patterns (apply most specific first)
+            # Remove -en suffix (e.g., maschinen -> maschin, frauen -> frau)
+            if tok.endswith('en') and len(tok) > 5:
+                return tok[:-2]
+            # Remove -n suffix for words not ending in -en
+            elif tok.endswith('n') and len(tok) > 5:
+                return tok[:-1]
+            # Remove -e suffix (e.g., maschine -> maschin, tage -> tag)
+            elif tok.endswith('e') and len(tok) > 5:
+                return tok[:-1]
+            # Remove -s suffix (e.g., autos -> auto)
+            elif tok.endswith('s') and len(tok) > 4:
+                return tok[:-1]
+            
+            return tok
+
         # Step 1: Build training_kw_occurrences (case-insensitive)
         training_kw_occurrences = {}
         for rec in training_records:
@@ -1309,14 +1333,16 @@ def main():
             raw_keywords = rec.get("keywords") or []
             if not isinstance(raw_keywords, list):
                 continue
-            # Build lowercased set of keywords for this record
+            # Build lowercased and normalized set of keywords for this record
             keywords_set_lower = set()
             for kw in raw_keywords:
                 if kw is None:
                     continue
                 kw_lower = str(kw).strip().lower()
                 if kw_lower:
-                    keywords_set_lower.add(kw_lower)
+                    # Apply normalization to treat singular/plural as equal
+                    kw_normalized = _normalize_token(kw_lower)
+                    keywords_set_lower.add(kw_normalized)
             
             if not keywords_set_lower:
                 continue
@@ -1360,14 +1386,16 @@ def main():
                     else:
                         kws = [raw_keywords]
 
-                    # Build lowercased set of keywords for this product
+                    # Build lowercased and normalized set of keywords for this product
                     keywords_set_lower = set()
                     for kw in kws:
                         if kw is None:
                             continue
                         kw_lower = str(kw).strip().lower()
                         if kw_lower:
-                            keywords_set_lower.add(kw_lower)
+                            # Apply normalization to treat singular/plural as equal
+                            kw_normalized = _normalize_token(kw_lower)
+                            keywords_set_lower.add(kw_normalized)
                     
                     if not keywords_set_lower:
                         continue
@@ -1400,9 +1428,11 @@ def main():
                 )
                 keyword = r["keyword"]
                 keyword_lower = keyword.strip().lower()
+                # Normalize keyword to match how it was indexed
+                keyword_normalized = _normalize_token(keyword_lower)
 
                 # Get occurrences for this keyword
-                occ_list = training_kw_occurrences.get(keyword_lower, [])
+                occ_list = training_kw_occurrences.get(keyword_normalized, [])
                 if not occ_list:
                     continue
 
@@ -1475,7 +1505,7 @@ def main():
                     continue
 
                 # Compute vendor stats under K2 semantics
-                vendor_occ_list = vendor_kw_occurrences.get(keyword_lower, [])
+                vendor_occ_list = vendor_kw_occurrences.get(keyword_normalized, [])
                 vendor_total_k2 = 0
                 vendor_inside_k2 = 0
                 vendor_outside_k2 = 0
