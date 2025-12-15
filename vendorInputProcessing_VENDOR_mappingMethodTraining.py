@@ -1262,259 +1262,280 @@ def main():
             rule_proposals.append(rule_obj)
 
         # =========================================================
-        # K2 Mapping Method: Generate exclude-based rules
-        # =========================================================
-        current_step = "STEP K2: Generate K2 exclude-based keyword rules"
-        log_info(logger, current_step)
-        print("DEBUG: STEP K2 – starting K2 rule generation")
+        # ---------- K2: contains_any_exclude_any refined implementation (with extra logging) ----------
+        import re
 
-        # Step 1: Build training_kw_occurrences (case-insensitive)
-        training_kw_occurrences = {}
-        for rec in training_records:
-            pim_category_id_raw = rec.get("pim_category_id")
-            # Normalize pim_category_id to string for consistent comparisons
-            pim_category_id = str(pim_category_id_raw) if pim_category_id_raw is not None else None
-            raw_keywords = rec.get("keywords") or []
-            if not isinstance(raw_keywords, list):
-                continue
-            # Build lowercased set of keywords for this record
-            keywords_set_lower = set()
-            for kw in raw_keywords:
-                if kw is None:
-                    continue
-                kw_lower = str(kw).strip().lower()
-                if kw_lower:
-                    keywords_set_lower.add(kw_lower)
-            
-            if not keywords_set_lower:
-                continue
-            
-            # Add to occurrence index for each keyword
-            for kw_lower in keywords_set_lower:
-                if kw_lower not in training_kw_occurrences:
-                    training_kw_occurrences[kw_lower] = []
-                training_kw_occurrences[kw_lower].append({
-                    "pim_category_id": pim_category_id,
-                    "keywords_set_lower": keywords_set_lower
-                })
+        def _is_meaningful_token(tok: str) -> bool:
+            if not tok:
+                return False
+            if len(tok) < 4:
+                return False
+            if not any(ch.isalpha() for ch in tok):
+                return False
+            if re.fullmatch(r'[0-9]+', tok):
+                return False
+            if re.fullmatch(r'[0-9\.\-_/]+', tok):
+                return False
+            return True
 
-        # Step 2: Build vendor_kw_occurrences from match_data (case-insensitive)
-        vendor_kw_occurrences = {}
-        for vcat_key, vcat_record in match_data.items():
-            if not isinstance(vcat_record, dict):
-                continue
-            pim_matches = vcat_record.get("pim_matches") or []
-            if not isinstance(pim_matches, list):
-                continue
+        try:
+            log_info(logger, "STEP D5-K2: Starting K2 candidate generation (contains_any_exclude_any)")
+            print("DEBUG: STEP D5-K2 – starting K2 generation")
 
-            for m in pim_matches:
-                if not isinstance(m, dict):
-                    continue
-                pim_category_id_raw = m.get("pim_category_id")
-                # Normalize pim_category_id to string for consistent comparisons
-                pim_category_id = str(pim_category_id_raw) if pim_category_id_raw is not None else None
-                products = m.get("products") or []
-                if not isinstance(products, list):
-                    continue
-
-                for p in products:
-                    if not isinstance(p, dict):
-                        continue
-                    raw_keywords = p.get("keywords")
-                    if raw_keywords is None:
-                        kws = []
-                    elif isinstance(raw_keywords, list):
-                        kws = raw_keywords
-                    else:
-                        kws = [raw_keywords]
-
-                    # Build lowercased set of keywords for this product
-                    keywords_set_lower = set()
-                    for kw in kws:
-                        if kw is None:
+            # 1) Build training index: lower_keyword -> list of occurrences {pim_category_id, keywords_set}
+            training_kw_occurrences = {}
+            if isinstance(training_records, list):
+                for trec in training_records:
+                    try:
+                        cid = trec.get("pim_category_id")
+                        kws = trec.get("keywords") or []
+                        kwset = set(str(k).strip().lower() for k in kws if k is not None and str(k).strip() != "")
+                        if not kwset:
                             continue
-                        kw_lower = str(kw).strip().lower()
-                        if kw_lower:
-                            keywords_set_lower.add(kw_lower)
-                    
-                    if not keywords_set_lower:
-                        continue
-                    
-                    # Add to occurrence index for each keyword
-                    for kw_lower in keywords_set_lower:
-                        if kw_lower not in vendor_kw_occurrences:
-                            vendor_kw_occurrences[kw_lower] = []
-                        vendor_kw_occurrences[kw_lower].append({
-                            "pim_category_id": pim_category_id,
-                            "keywords_set_lower": keywords_set_lower
-                        })
+                        for k in kwset:
+                            training_kw_occurrences.setdefault(k, []).append({
+                                "pim_category_id": str(cid) if cid is not None else None,
+                                "keywords_set": kwset,
+                            })
+                    except Exception:
+                        log_warning(logger, "STEP D5-K2: Skipped malformed training record during index build")
+            else:
+                log_warning(logger, "STEP D5-K2: training_records not a list; skipping K2 training index build")
 
-        # Step 3: Select K2 candidate rows from df_stats
-        k2_candidates = df_stats.where(
-            (F.col("inside_count") >= F.lit(MIN_KEYWORD_INSIDE_SUPPORT))
-            & (F.col("hard_outside_count") > F.lit(MAX_KEYWORD_HARD_OUTSIDE))
-        ).collect()
-
-        log_info(logger, f"STEP K2: Found {len(k2_candidates)} K2 candidate rows")
-        print(f"DEBUG: STEP K2 – found {len(k2_candidates)} K2 candidates")
-
-        # Step 4: Process each K2 candidate
-        k2_rules_count = 0
-        for r in k2_candidates:
+            # 2) Build vendor index from match_data to obtain full product keyword sets
+            vendor_kw_occurrences = {}
             try:
-                pim_category_id = r["pim_category_id"]
-                pim_category_id_norm = (
-                    str(pim_category_id) if pim_category_id is not None else None
-                )
-                keyword = r["keyword"]
-                keyword_lower = keyword.strip().lower()
-
-                # Get occurrences for this keyword
-                occ_list = training_kw_occurrences.get(keyword_lower, [])
-                if not occ_list:
-                    continue
-
-                # Partition into inside and outside sets
-                inside_sets = []
-                outside_sets = []
-                for occ in occ_list:
-                    occ_pim_category_id_norm = (
-                        str(occ["pim_category_id"]) if occ["pim_category_id"] is not None else None
-                    )
-                    if occ_pim_category_id_norm == pim_category_id_norm:
-                        inside_sets.append(occ["keywords_set_lower"])
-                    else:
-                        outside_sets.append(occ["keywords_set_lower"])
-
-                # Compute inside_tokens and outside_tokens
-                inside_tokens = set()
-                for s in inside_sets:
-                    inside_tokens.update(s)
-                
-                outside_tokens = set()
-                for s in outside_sets:
-                    outside_tokens.update(s)
-
-                # Compute exclude_candidates (only tokens appearing outside but not inside)
-                exclude_candidates_raw = outside_tokens - inside_tokens
-                if not exclude_candidates_raw:
-                    # Skip if no exclude candidates exist (keyword only appears inside target category)
-                    continue
-
-                # Apply MIN_K2_EXCLUDE_SUPPORT: filter exclude candidates by support count
-                # Count how many times each exclude candidate appears in outside_sets
-                exclude_support_counts = {}
-                for token in exclude_candidates_raw:
-                    count = sum(1 for s in outside_sets if token in s)
-                    exclude_support_counts[token] = count
-                
-                # Keep only candidates with sufficient support
-                exclude_candidates = {
-                    token for token in exclude_candidates_raw
-                    if exclude_support_counts.get(token, 0) >= MIN_K2_EXCLUDE_SUPPORT
-                }
-                
-                if not exclude_candidates:
-                    continue
-
-                # Apply MAX_K2_EXCLUDES_PER_RULE: limit number of exclude tokens
-                if len(exclude_candidates) > MAX_K2_EXCLUDES_PER_RULE:
-                    # Select top N tokens by support count
-                    sorted_candidates = sorted(
-                        exclude_candidates,
-                        key=lambda t: exclude_support_counts.get(t, 0),
-                        reverse=True
-                    )
-                    exclude_candidates = set(sorted_candidates[:MAX_K2_EXCLUDES_PER_RULE])
-
-                # Validate coverage: require that exclude_candidates cover at least
-                # MIN_K2_OUTSIDE_COVERAGE_RATIO of outside occurrences
-                covered_outside_sets = sum(1 for s in outside_sets if s & exclude_candidates)
-                total_outside_sets = len(outside_sets)
-                
-                if total_outside_sets > 0:
-                    coverage_ratio = covered_outside_sets / total_outside_sets
-                    if coverage_ratio < MIN_K2_OUTSIDE_COVERAGE_RATIO:
+                for vcat_key, vcat_record in (match_data or {}).items():
+                    pim_matches = vcat_record.get("pim_matches") or []
+                    if not isinstance(pim_matches, list):
                         continue
-                else:
-                    # No outside sets to cover, skip this candidate
-                    continue
+                    for m in pim_matches:
+                        pim_category_id = m.get("pim_category_id")
+                        products = m.get("products") or []
+                        if not isinstance(products, list):
+                            continue
+                        for p in products:
+                            raw_keywords = p.get("keywords")
+                            if raw_keywords is None:
+                                kws = []
+                            elif isinstance(raw_keywords, list):
+                                kws = raw_keywords
+                            else:
+                                kws = [raw_keywords]
+                            kwset = set(str(k).strip().lower() for k in kws if k is not None and str(k).strip() != "")
+                            if not kwset:
+                                continue
+                            for k in kwset:
+                                vendor_kw_occurrences.setdefault(k, []).append({
+                                    "pim_category_id": str(pim_category_id) if pim_category_id is not None else None,
+                                    "keywords_set": kwset,
+                                })
+            except Exception:
+                log_warning(logger, "STEP D5-K2: Failed building vendor_kw_occurrences from match_data; vendor K2 stats may be incomplete")
 
-                # Compute vendor stats under K2 semantics
-                vendor_occ_list = vendor_kw_occurrences.get(keyword_lower, [])
-                vendor_total_k2 = 0
-                vendor_inside_k2 = 0
-                vendor_outside_k2 = 0
+            # 3) Collect K2 candidates from df_stats: inside_count >= MIN_KEYWORD_INSIDE_SUPPORT and hard_outside_count > 0
+            try:
+                df_k2_candidates = df_stats.where(
+                    (F.col("inside_count") >= F.lit(MIN_KEYWORD_INSIDE_SUPPORT))
+                    & (F.col("hard_outside_count") > F.lit(MAX_KEYWORD_HARD_OUTSIDE))
+                )
+                k2_rows = df_k2_candidates.collect()
+            except Exception as e_k2c:
+                log_warning(logger, f"STEP D5-K2: Could not collect K2 candidates: {repr(e_k2c)}")
+                k2_rows = []
 
-                for vocc in vendor_occ_list:
-                    # If keyword set intersects exclude_candidates, exclude this occurrence
-                    if vocc["keywords_set_lower"] & exclude_candidates:
+            log_info(logger, f"STEP D5-K2: K2 candidates found={len(k2_rows)}")
+            print(f"DEBUG: STEP D5-K2 – candidates count: {len(k2_rows)}")
+
+            k2_added = 0
+
+            for r in k2_rows:
+                try:
+                    pim_category_id = r["pim_category_id"]
+                    pim_cid_str = str(pim_category_id) if pim_category_id is not None else None
+                    raw_keyword = r["keyword"]
+                    if raw_keyword is None:
                         continue
-                    
-                    # Count this occurrence
-                    vendor_total_k2 += 1
-                    vocc_pim_category_id_norm = (
-                        str(vocc["pim_category_id"]) if vocc["pim_category_id"] is not None else None
-                    )
-                    if vocc_pim_category_id_norm == pim_category_id_norm:
-                        vendor_inside_k2 += 1
-                    else:
-                        vendor_outside_k2 += 1
+                    k_lower = str(raw_keyword).strip().lower()
 
-                # Decide vendor_status_k2
-                if vendor_total_k2 == 0:
-                    vendor_status_k2 = "not_impacted"
-                elif vendor_inside_k2 >= MIN_VENDOR_INSIDE_SUPPORT and vendor_outside_k2 <= MAX_VENDOR_OUTSIDE_SUPPORT:
-                    # Check if this is a known rule from previous training
-                    known_in_previous = r["known_in_previous_training"] if r["known_in_previous_training"] is not None else False
-                    vendor_status_k2 = "new" if not known_in_previous else "supported"
-                else:
-                    # Vendor violates K2 semantics, skip this candidate
+                    log_info(logger, f"STEP D5-K2: Evaluating candidate cid={pim_cid_str} keyword='{raw_keyword}' (norm='{k_lower}')")
+                    print(f"DEBUG: STEP D5-K2 – evaluating cid={pim_cid_str} kw={raw_keyword}")
+
+                    occ_list = training_kw_occurrences.get(k_lower, [])
+                    if not occ_list:
+                        log_info(logger, f"STEP D5-K2: No training occurrences for keyword '{k_lower}' -> skip")
+                        continue
+
+                    # partition into inside and outside occurrences
+                    inside_sets = [occ["keywords_set"] for occ in occ_list if occ.get("pim_category_id") == pim_cid_str]
+                    outside_sets = [occ["keywords_set"] for occ in occ_list if occ.get("pim_category_id") != pim_cid_str]
+
+                    log_info(logger, f"STEP D5-K2: candidate occurrences: inside={len(inside_sets)} outside={len(outside_sets)}")
+                    print(f"DEBUG: STEP D5-K2 – occurrence counts inside={len(inside_sets)} outside={len(outside_sets)}")
+
+                    if not inside_sets or not outside_sets:
+                        log_info(logger, f"STEP D5-K2: Skipping candidate cid={pim_cid_str} kw={k_lower} because inside_sets or outside_sets empty")
+                        continue
+
+                    inside_tokens = set().union(*inside_sets) if inside_sets else set()
+                    outside_tokens = set().union(*outside_sets) if outside_sets else set()
+
+                    raw_excludes = outside_tokens - inside_tokens
+                    log_info(logger, f"STEP D5-K2: raw_excludes count={len(raw_excludes)} sample={list(raw_excludes)[:10]}")
+                    print(f"DEBUG: STEP D5-K2 – raw_excludes ({len(raw_excludes)}): {list(raw_excludes)[:10]}")
+
+                    if not raw_excludes:
+                        log_info(logger, f"STEP D5-K2: No raw excludes for cid={pim_cid_str} kw={k_lower} -> skip")
+                        continue
+
+                    # lexical filter: keep only meaningful tokens
+                    candidate_excludes = [tok for tok in raw_excludes if _is_meaningful_token(tok)]
+                    log_info(logger, f"STEP D5-K2: candidate_excludes after lexical filter count={len(candidate_excludes)} sample={candidate_excludes[:10]}")
+                    print(f"DEBUG: STEP D5-K2 – candidate_excludes ({len(candidate_excludes)}): {candidate_excludes[:10]}")
+
+                    if not candidate_excludes:
+                        log_info(logger, f"STEP D5-K2: All raw_excludes filtered out by lexical filter for cid={pim_cid_str} kw={k_lower} -> skip")
+                        continue
+
+                    total_outside = len(outside_sets)
+                    if total_outside == 0:
+                        log_info(logger, f"STEP D5-K2: total_outside==0 for cid={pim_cid_str} kw={k_lower} -> skip")
+                        continue
+
+                    # compute outside_support for each token
+                    outside_support = {}
+                    for tok in candidate_excludes:
+                        cnt = 0
+                        for s in outside_sets:
+                            if tok in s:
+                                cnt += 1
+                        outside_support[tok] = cnt
+
+                    # log top candidates by support
+                    sorted_by_support = sorted(outside_support.items(), key=lambda kv: kv[1], reverse=True)
+                    log_info(logger, f"STEP D5-K2: outside_support sample (top 10) for cid={pim_cid_str} kw={k_lower}: {sorted_by_support[:10]}")
+                    print(f"DEBUG: STEP D5-K2 – outside_support top: {sorted_by_support[:10]} total_outside={total_outside}")
+
+                    # keep only tokens meeting MIN_K2_EXCLUDE_SUPPORT or coverage ratio
+                    supported_excludes = [tok for tok, cnt in outside_support.items()
+                                          if (cnt >= MIN_K2_EXCLUDE_SUPPORT) or (cnt / total_outside >= MIN_K2_OUTSIDE_COVERAGE_RATIO)]
+                    log_info(logger, f"STEP D5-K2: supported_excludes after support filter count={len(supported_excludes)} sample={supported_excludes[:10]}")
+                    print(f"DEBUG: STEP D5-K2 – supported_excludes ({len(supported_excludes)}): {supported_excludes[:10]}")
+
+                    if not supported_excludes:
+                        log_info(logger, f"STEP D5-K2: No supported_excludes (coverage) for cid={pim_cid_str} kw={k_lower} -> skip")
+                        continue
+
+                    # greedy cover selection
+                    token_covers = {}
+                    for tok in supported_excludes:
+                        covers = {i for i, s in enumerate(outside_sets) if tok in s}
+                        if covers:
+                            token_covers[tok] = covers
+
+                    if not token_covers:
+                        log_info(logger, f"STEP D5-K2: token_covers empty for cid={pim_cid_str} kw={k_lower} -> skip")
+                        continue
+
+                    uncovered = set(range(len(outside_sets)))
+                    sorted_tokens = sorted(token_covers.keys(), key=lambda t: len(token_covers[t]), reverse=True)
+                    E = []
+                    for tok in sorted_tokens:
+                        covers = token_covers.get(tok, set()) & uncovered
+                        if not covers:
+                            continue
+                        E.append(tok)
+                        uncovered -= covers
+                        log_info(logger, f"STEP D5-K2: greedy add tok='{tok}' covers={len(covers)} remaining_uncovered={len(uncovered)}")
+                        print(f"DEBUG: STEP D5-K2 – greedy add {tok} covers={len(covers)} remaining_uncovered={len(uncovered)}")
+                        if not uncovered or len(E) >= MAX_K2_EXCLUDES_PER_RULE:
+                            break
+
+                    log_info(logger, f"STEP D5-K2: greedy selection finished for cid={pim_cid_str} kw={k_lower} -> E_count={len(E)} uncovered_remaining={len(uncovered)}")
+                    print(f"DEBUG: STEP D5-K2 – greedy finished E={len(E)} uncovered={len(uncovered)}")
+
+                    if not E:
+                        log_info(logger, f"STEP D5-K2: E is empty after greedy selection for cid={pim_cid_str} kw={k_lower} -> skip")
+                        continue
+
+                    # final coverage check
+                    final_covered = sum(1 for s in outside_sets if any(tok in s for tok in E))
+                    final_coverage = final_covered / total_outside if total_outside > 0 else 0
+                    log_info(logger, f"STEP D5-K2: final coverage={final_coverage:.3f} for cid={pim_cid_str} kw={k_lower}")
+                    print(f"DEBUG: STEP D5-K2 – final coverage={final_coverage:.3f}")
+
+                    if final_coverage < MIN_K2_OUTSIDE_COVERAGE_RATIO:
+                        log_info(logger, f"STEP D5-K2: final_coverage={final_coverage:.3f} < {MIN_K2_OUTSIDE_COVERAGE_RATIO} for cid={pim_cid_str} kw={k_lower} -> skip")
+                        continue
+
+                    # compute vendor stats
+                    vendor_occ_list = vendor_kw_occurrences.get(k_lower, [])
+                    vendor_total_k2 = 0
+                    vendor_inside_k2 = 0
+                    vendor_outside_k2 = 0
+
+                    for vocc in vendor_occ_list:
+                        if vocc["keywords_set"] & set(E):
+                            continue
+                        vendor_total_k2 += 1
+                        vocc_cid = vocc.get("pim_category_id")
+                        if vocc_cid == pim_cid_str:
+                            vendor_inside_k2 += 1
+                        else:
+                            vendor_outside_k2 += 1
+
+                    log_info(logger, f"STEP D5-K2: vendor_stats: inside={vendor_inside_k2} outside={vendor_outside_k2} total={vendor_total_k2}")
+                    print(f"DEBUG: STEP D5-K2 – vendor inside={vendor_inside_k2} outside={vendor_outside_k2} total={vendor_total_k2}")
+
+                    # decide vendor_status
+                    if vendor_total_k2 == 0:
+                        vendor_status_k2 = "not_impacted"
+                    elif vendor_inside_k2 >= MIN_VENDOR_INSIDE_SUPPORT and vendor_outside_k2 <= MAX_VENDOR_OUTSIDE_SUPPORT:
+                        known_in_previous = r["known_in_previous_training"] if r["known_in_previous_training"] is not None else False
+                        vendor_status_k2 = "new" if not known_in_previous else "supported"
+                    else:
+                        log_info(logger, f"STEP D5-K2: vendor violates support thresholds for cid={pim_cid_str} kw={k_lower} -> skip")
+                        continue
+
+                    # build K2 rule
+                    pim_category_name = category_name_map.get(pim_cid_str)
+                    inside_count = int(r["inside_count"]) if r["inside_count"] is not None else 0
+
+                    k2_rule_obj = {
+                        "pim_category_id": pim_category_id,
+                        "pim_category_name": pim_category_name,
+                        "field_name": "KEYWORD",
+                        "operator": "contains_any_exclude_any",
+                        "values_include": [str(raw_keyword).strip()],
+                        "values_exclude": sorted(E),
+                        "stats": {
+                            "inside_count": inside_count,
+                            "train_total_count": inside_count,
+                            "hard_outside_count": 0,
+                            "vendor_inside_count": vendor_inside_k2,
+                            "vendor_total_count": vendor_total_k2,
+                            "vendor_outside_count": vendor_outside_k2,
+                            "vendor_status": vendor_status_k2,
+                        },
+                    }
+                    rule_proposals.append(k2_rule_obj)
+                    k2_added += 1
+
+                    log_info(logger, f"STEP D5-K2: ACCEPTED K2 rule cid={pim_cid_str} kw={raw_keyword} excludes={E} vendor_status={vendor_status_k2}")
+                    print(f"DEBUG: STEP D5-K2 – ACCEPTED rule cid={pim_cid_str} kw={raw_keyword}")
+
+                except Exception as e_k2_row:
+                    log_warning(logger, f"STEP D5-K2: Exception processing K2 candidate row: {repr(e_k2_row)}")
                     continue
 
-                # Build K2 rule object
-                pim_category_id_str = str(pim_category_id) if pim_category_id is not None else None
-                pim_category_name = category_name_map.get(pim_category_id_str)
-                inside_count = int(r["inside_count"]) if r["inside_count"] is not None else 0
+            log_info(logger, f"STEP D5-K2: Appended {k2_added} K2 rules to rule_proposals")
+            print(f"DEBUG: STEP D5-K2 – appended {k2_added} K2 rules")
 
-                k2_rule_obj = {
-                    "pim_category_id": pim_category_id,
-                    "pim_category_name": pim_category_name,
-                    "field_name": "KEYWORD",
-                    "operator": "contains_any_exclude_any",
-                    "values_include": [keyword.strip()],
-                    "values_exclude": sorted(list(exclude_candidates)),
-                    "stats": {
-                        "inside_count": inside_count,
-                        "train_total_count": inside_count,
-                        "hard_outside_count": 0,
-                        "vendor_inside_count": vendor_inside_k2,
-                        "vendor_total_count": vendor_total_k2,
-                        "vendor_outside_count": vendor_outside_k2,
-                        "vendor_status": vendor_status_k2,
-                    },
-                }
-                rule_proposals.append(k2_rule_obj)
-                k2_rules_count += 1
+        except Exception as e_k2_outer:
+            log_warning(logger, f"STEP D5-K2: K2 block failed with exception: {repr(e_k2_outer)}")
+            print(f"DEBUG: STEP D5-K2 – K2 block exception: {repr(e_k2_outer)}")
 
-                # Log accepted K2 rule
-                log_info(
-                    logger,
-                    f"STEP K2: Accepted K2 rule - category={pim_category_id}, "
-                    f"keyword={keyword}, exclude_count={len(exclude_candidates)}, "
-                    f"vendor_status={vendor_status_k2}"
-                )
-
-            except Exception as e_k2:
-                log_warning(
-                    logger,
-                    f"STEP K2: Failed to process K2 candidate "
-                    f"(category={r.get('pim_category_id')}, keyword={r.get('keyword')}): {repr(e_k2)}"
-                )
-                continue
-
-        log_info(logger, f"STEP K2: Appended {k2_rules_count} K2 rules to rule_proposals")
-        print(f"DEBUG: STEP K2 – appended {k2_rules_count} K2 rules")
+        # ---------- end K2 block ----------
 
         log_info(
             logger,
