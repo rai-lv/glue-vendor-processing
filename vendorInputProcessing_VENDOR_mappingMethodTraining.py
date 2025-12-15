@@ -2,6 +2,7 @@
 # Glue 5.0 / Spark / Python 3 script
 #
 # STEP: Update Stable Training Dataset per vendor.
+# MODIFICATION: K2 block enhanced with diagnostic logging (lines 1265-1538)
 #
 # Triggered from Lambda/Make with payload:
 # {
