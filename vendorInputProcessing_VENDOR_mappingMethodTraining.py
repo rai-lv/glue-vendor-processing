@@ -151,13 +151,14 @@ def normalize_training_record(rec: dict) -> dict:
         keywords = []
     elif isinstance(raw_keywords, list):
         # Trim whitespace from each keyword so training-side keywords match vendor-side trimming
+        # Apply token normalization to treat singular/plural forms as equal
         keywords = [
-            str(k).strip() for k in raw_keywords
+            _normalize_token(str(k).strip().lower()) for k in raw_keywords
             if k is not None and str(k).strip() != ""
         ]
     else:
         kw_str = str(raw_keywords).strip()
-        keywords = [kw_str] if kw_str != "" else []
+        keywords = [_normalize_token(kw_str.lower())] if kw_str != "" else []
     out["keywords"] = keywords
 
     # Normalise class_codes: always a list of {system, code}
@@ -909,9 +910,11 @@ def main():
                         kw_str = str(kw).strip()
                         if not kw_str:
                             continue
+                        # Apply normalization to treat singular/plural forms as equal
+                        kw_normalized = _normalize_token(kw_str.lower())
                         prev_kw_rows.append({
                             "pim_category_id": str(pim_category_id) if pim_category_id is not None else None,
-                            "keyword": kw_str,
+                            "keyword": kw_normalized,
                         })
 
                 if prev_kw_rows:
