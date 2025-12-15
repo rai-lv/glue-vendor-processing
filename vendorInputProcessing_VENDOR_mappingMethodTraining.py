@@ -102,6 +102,16 @@ MAX_KEYWORD_HARD_OUTSIDE = 0
 MIN_VENDOR_INSIDE_SUPPORT = 3
 MAX_VENDOR_OUTSIDE_SUPPORT = 0
 
+# K2 (exclude-based) rule thresholds:
+# - MIN_K2_EXCLUDE_SUPPORT: minimum occurrences of an exclude token outside the
+#   target category to be considered as a valid exclude candidate.
+# - MIN_K2_OUTSIDE_COVERAGE_RATIO: minimum ratio of outside occurrences that must
+#   be covered by the exclude list.
+# - MAX_K2_EXCLUDES_PER_RULE: maximum number of exclude tokens per K2 rule.
+MIN_K2_EXCLUDE_SUPPORT = 3
+MIN_K2_OUTSIDE_COVERAGE_RATIO = 0.2
+MAX_K2_EXCLUDES_PER_RULE = 5
+
 
 def normalize_training_record(rec: dict) -> dict:
     """
@@ -1385,19 +1395,49 @@ def main():
                 for s in outside_sets:
                     outside_tokens.update(s)
 
-                # Compute exclude_candidates
-                exclude_candidates = outside_tokens - inside_tokens
+                # Compute exclude_candidates (only tokens appearing outside but not inside)
+                exclude_candidates_raw = outside_tokens - inside_tokens
+                if not exclude_candidates_raw:
+                    # Skip if no exclude candidates exist (keyword only appears inside target category)
+                    continue
+
+                # Apply MIN_K2_EXCLUDE_SUPPORT: filter exclude candidates by support count
+                # Count how many times each exclude candidate appears in outside_sets
+                exclude_support_counts = {}
+                for token in exclude_candidates_raw:
+                    count = sum(1 for s in outside_sets if token in s)
+                    exclude_support_counts[token] = count
+                
+                # Keep only candidates with sufficient support
+                exclude_candidates = {
+                    token for token in exclude_candidates_raw
+                    if exclude_support_counts.get(token, 0) >= MIN_K2_EXCLUDE_SUPPORT
+                }
+                
                 if not exclude_candidates:
                     continue
 
-                # Validate coverage: all outside sets must intersect exclude_candidates
-                coverage_ok = True
-                for s in outside_sets:
-                    if not (s & exclude_candidates):
-                        coverage_ok = False
-                        break
+                # Apply MAX_K2_EXCLUDES_PER_RULE: limit number of exclude tokens
+                if len(exclude_candidates) > MAX_K2_EXCLUDES_PER_RULE:
+                    # Select top N tokens by support count
+                    sorted_candidates = sorted(
+                        exclude_candidates,
+                        key=lambda t: exclude_support_counts.get(t, 0),
+                        reverse=True
+                    )
+                    exclude_candidates = set(sorted_candidates[:MAX_K2_EXCLUDES_PER_RULE])
+
+                # Validate coverage: require that exclude_candidates cover at least
+                # MIN_K2_OUTSIDE_COVERAGE_RATIO of outside occurrences
+                covered_outside_sets = sum(1 for s in outside_sets if s & exclude_candidates)
+                total_outside_sets = len(outside_sets)
                 
-                if not coverage_ok:
+                if total_outside_sets > 0:
+                    coverage_ratio = covered_outside_sets / total_outside_sets
+                    if coverage_ratio < MIN_K2_OUTSIDE_COVERAGE_RATIO:
+                        continue
+                else:
+                    # No outside sets to cover, skip this candidate
                     continue
 
                 # Compute vendor stats under K2 semantics
