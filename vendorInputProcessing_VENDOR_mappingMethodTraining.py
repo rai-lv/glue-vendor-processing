@@ -40,6 +40,7 @@ import json
 import re
 import traceback
 import os
+import unicodedata
 from datetime import datetime, timezone
 
 import boto3
@@ -150,15 +151,16 @@ def normalize_training_record(rec: dict) -> dict:
     if raw_keywords is None:
         keywords = []
     elif isinstance(raw_keywords, list):
-        # Trim whitespace from each keyword so training-side keywords match vendor-side trimming
-        # Apply token normalization to treat singular/plural forms as equal
-        keywords = [
-            _normalize_token(str(k).strip().lower()) for k in raw_keywords
-            if k is not None and str(k).strip() != ""
-        ]
+        keywords = []
+        for k in raw_keywords:
+            if k is None:
+                continue
+            kw_norm = normalize_keyword_de(k)
+            if kw_norm is not None:
+                keywords.append(kw_norm)
     else:
-        kw_str = str(raw_keywords).strip()
-        keywords = [_normalize_token(kw_str.lower())] if kw_str != "" else []
+        kw_norm = normalize_keyword_de(raw_keywords)
+        keywords = [kw_norm] if kw_norm is not None else []
     out["keywords"] = keywords
 
     # Normalise class_codes: always a list of {system, code}
@@ -205,29 +207,92 @@ def normalize_training_record(rec: dict) -> dict:
     return out
 
 
-def _normalize_token(tok: str) -> str:
+def _german2_normalize(token: str) -> str:
     """
-    Apply simple stemming to normalize singular/plural forms.
-    Removes common German plural suffixes to treat variants as equal.
+    Apply GermanNormalizationFilter-style rules (German2 heuristics).
+    This replicates the Lucene/Snowball approach to umlaut and ligature handling.
     """
-    if not tok or len(tok) < 5:
-        return tok
-    
-    # Common German plural patterns (apply most specific first)
-    # Remove -en suffix (e.g., maschinen -> maschin, frauen -> frau)
-    if tok.endswith('en') and len(tok) > 5:
-        return tok[:-2]
-    # Remove -n suffix for words not ending in -en
-    elif tok.endswith('n') and len(tok) > 5:
-        return tok[:-1]
-    # Remove -e suffix (e.g., maschine -> maschin, tage -> tag)
-    elif tok.endswith('e') and len(tok) > 5:
-        return tok[:-1]
-    # Remove -s suffix (e.g., autos -> auto)
-    elif tok.endswith('s') and len(tok) > 4:
-        return tok[:-1]
-    
-    return tok
+    token = token.replace("ß", "ss")
+    token = token.replace("ä", "a").replace("ö", "o").replace("ü", "u")
+    token = re.sub("ae", "a", token)
+    token = re.sub("oe", "o", token)
+    token = re.sub(r"(?<![aeiouq])ue", "u", token)
+    return token
+
+
+# CISTEM stemmer implementation (pure Python)
+# Source: https://github.com/LeoniePhiline/cistem
+# License: BSD 2-Clause "Simplified" License
+def _cistem_stem(token: str) -> str:
+    """
+    German stemming using the CISTEM algorithm (ported directly from the
+    reference implementation). This version is case-insensitive.
+    """
+    if not token:
+        return ""
+
+    word = token
+
+    # Normalise ß early, then lowercase
+    word = word.replace("ß", "ss")
+    word = word.lower()
+
+    # Compact frequent bigrams/trigrams
+    substitutions = (
+        ("sch", "$"),
+        ("ch", "§"),
+        ("ei", "%"),
+        ("ie", "&"),
+        ("ig", "#"),
+        ("st", "!")
+    )
+    for old, new in substitutions:
+        word = word.replace(old, new)
+
+    # Handle double letters
+    word = re.sub(r"([bdfghklmnrt])\1", r"\1", word)
+
+    # Remove circumfix / prefix
+    if word.startswith("ge") and len(word) > 4:
+        word = word[2:]
+
+    # Iteratively remove common endings
+    endings = ("em", "ern", "er", "en", "es", "e", "s", "n")
+    for _ in range(2):
+        for suf in endings:
+            if word.endswith(suf) and len(word) - len(suf) >= 3:
+                word = word[: -len(suf)]
+                break
+
+    # Restore substitutions
+    for old, new in reversed(substitutions):
+        word = word.replace(new, old)
+
+    return word
+
+
+def normalize_keyword_de(keyword: str) -> str | None:
+    """
+    Canonical German keyword normalisation used across all steps.
+    - Trims whitespace and drops empty tokens
+    - Unicode NFKC + casefold
+    - German2-style character normalisation (ß/umlaut + ae/oe/ue handling)
+    - CISTEM stemming
+    """
+    if keyword is None:
+        return None
+
+    token = str(keyword).strip()
+    if not token:
+        return None
+
+    token = unicodedata.normalize("NFKC", token)
+    token = token.casefold()
+    token = _german2_normalize(token)
+    token = _cistem_stem(token)
+    token = token.strip()
+
+    return token or None
 
 
 def main():
@@ -907,11 +972,9 @@ def main():
                     for kw in raw_keywords:
                         if kw is None:
                             continue
-                        kw_str = str(kw).strip()
-                        if not kw_str:
+                        kw_normalized = normalize_keyword_de(kw)
+                        if kw_normalized is None:
                             continue
-                        # Apply normalization to treat singular/plural forms as equal
-                        kw_normalized = _normalize_token(kw_str.lower())
                         prev_kw_rows.append({
                             "pim_category_id": str(pim_category_id) if pim_category_id is not None else None,
                             "keyword": kw_normalized,
@@ -1340,12 +1403,8 @@ def main():
             # Build lowercased and normalized set of keywords for this record
             keywords_set_lower = set()
             for kw in raw_keywords:
-                if kw is None:
-                    continue
-                kw_lower = str(kw).strip().lower()
-                if kw_lower:
-                    # Apply normalization to treat singular/plural as equal
-                    kw_normalized = _normalize_token(kw_lower)
+                kw_normalized = normalize_keyword_de(kw)
+                if kw_normalized is not None:
                     keywords_set_lower.add(kw_normalized)
             
             if not keywords_set_lower:
@@ -1393,12 +1452,8 @@ def main():
                     # Build lowercased and normalized set of keywords for this product
                     keywords_set_lower = set()
                     for kw in kws:
-                        if kw is None:
-                            continue
-                        kw_lower = str(kw).strip().lower()
-                        if kw_lower:
-                            # Apply normalization to treat singular/plural as equal
-                            kw_normalized = _normalize_token(kw_lower)
+                        kw_normalized = normalize_keyword_de(kw)
+                        if kw_normalized is not None:
                             keywords_set_lower.add(kw_normalized)
                     
                     if not keywords_set_lower:
@@ -1431,9 +1486,9 @@ def main():
                     str(pim_category_id) if pim_category_id is not None else None
                 )
                 keyword = r["keyword"]
-                keyword_lower = keyword.strip().lower()
-                # Normalize keyword to match how it was indexed
-                keyword_normalized = _normalize_token(keyword_lower)
+                keyword_normalized = normalize_keyword_de(keyword)
+                if keyword_normalized is None:
+                    continue
 
                 # Get occurrences for this keyword
                 occ_list = training_kw_occurrences.get(keyword_normalized, [])
@@ -1550,7 +1605,7 @@ def main():
                     "pim_category_name": pim_category_name,
                     "field_name": "KEYWORD",
                     "operator": "contains_any_exclude_any",
-                    "values_include": [keyword.strip()],
+                    "values_include": [keyword_normalized],
                     "values_exclude": sorted(list(exclude_candidates)),
                     "stats": {
                         "inside_count": inside_count,
@@ -1569,7 +1624,7 @@ def main():
                 log_info(
                     logger,
                     f"STEP K2: Accepted K2 rule - category={pim_category_id}, "
-                    f"keyword={keyword}, exclude_count={len(exclude_candidates)}, "
+                    f"keyword={keyword_normalized}, exclude_count={len(exclude_candidates)}, "
                     f"vendor_status={vendor_status_k2}"
                 )
 
