@@ -37,8 +37,10 @@
 
 import sys
 import json
+import re
 import traceback
 import os
+import unicodedata
 from datetime import datetime, timezone
 
 import boto3
@@ -148,16 +150,23 @@ def normalize_training_record(rec: dict) -> dict:
     raw_keywords = out.get("keywords")
     if raw_keywords is None:
         keywords = []
+        keywords_norm = []
     elif isinstance(raw_keywords, list):
-        # Trim whitespace from each keyword so training-side keywords match vendor-side trimming
-        keywords = [
-            str(k).strip() for k in raw_keywords
-            if k is not None and str(k).strip() != ""
-        ]
+        keywords = []
+        keywords_norm = []
+        for k in raw_keywords:
+            if k is None:
+                continue
+            kw_norm = normalize_keyword_de(k)
+            if kw_norm is not None:
+                keywords.append(kw_norm)
+                keywords_norm.append(kw_norm)
     else:
-        kw_str = str(raw_keywords).strip()
-        keywords = [kw_str] if kw_str != "" else []
+        kw_norm = normalize_keyword_de(raw_keywords)
+        keywords = [kw_norm] if kw_norm is not None else []
+        keywords_norm = [kw_norm] if kw_norm is not None else []
     out["keywords"] = keywords
+    out["keywords_norm"] = keywords_norm
 
     # Normalise class_codes: always a list of {system, code}
     raw_class_codes = out.get("class_codes")
@@ -201,6 +210,241 @@ def normalize_training_record(rec: dict) -> dict:
 
     out["class_codes"] = norm_class_codes
     return out
+
+
+def _german2_normalize(token: str) -> str:
+    """
+    Apply GermanNormalizationFilter-style rules (German2 heuristics).
+    This replicates the Lucene/Snowball approach to umlaut and ligature handling.
+    """
+    token = token.replace("ß", "ss")
+    token = token.replace("ä", "a").replace("ö", "o").replace("ü", "u")
+    token = re.sub("ae", "a", token)
+    token = re.sub("oe", "o", token)
+    token = re.sub(r"(?<![aeiouq])ue", "u", token)
+    return token
+
+
+# CISTEM stemmer implementation (pure Python)
+# Source: https://github.com/LeoniePhiline/cistem
+# License: BSD 2-Clause "Simplified" License
+def _cistem_stem(token: str) -> str:
+    """
+    German stemming using the CISTEM algorithm (ported directly from the
+    reference implementation). This version is case-insensitive.
+    """
+    if not token:
+        return ""
+
+    word = token
+
+    # Normalise ß early, then lowercase
+    word = word.replace("ß", "ss")
+    word = word.lower()
+
+    # Compact frequent bigrams/trigrams
+    substitutions = (
+        ("sch", "$"),
+        ("ch", "§"),
+        ("ei", "%"),
+        ("ie", "&"),
+        ("ig", "#"),
+        ("st", "!")
+    )
+    for old, new in substitutions:
+        word = word.replace(old, new)
+
+    # Handle double letters (mark and later restore)
+    word = re.sub(r"([bdfghklmnrt])\1", r"\1*", word)
+
+    # Remove circumfix / prefix
+    if word.startswith("ge") and len(word) > 4:
+        word = word[2:]
+
+    # Iteratively remove common endings
+    endings = ("em", "ern", "er", "en", "es", "e", "s", "n")
+    for _ in range(2):
+        for suf in endings:
+            if word.endswith(suf) and len(word) - len(suf) >= 3:
+                word = word[: -len(suf)]
+                break
+
+    # Restore substitutions
+    for old, new in reversed(substitutions):
+        word = word.replace(new, old)
+
+    # Restore marked double letters
+    word = re.sub(r"([bdfghklmnrt])\*", r"\1\1", word)
+
+    return word
+
+
+def normalize_keyword_de(keyword: str) -> str | None:
+    """
+    Canonical German keyword normalisation used across all steps.
+    - Trims whitespace and drops empty tokens
+    - Unicode NFKC + casefold
+    - German2-style character normalisation (ß/umlaut + ae/oe/ue handling)
+    - CISTEM stemming
+    """
+    if keyword is None:
+        return None
+
+    token = str(keyword).strip()
+    if not token:
+        return None
+
+    token = unicodedata.normalize("NFKC", token)
+    token = token.casefold()
+    token = _german2_normalize(token)
+    token = _cistem_stem(token)
+    token = token.strip()
+
+    return token or None
+
+
+def normalize_keyword_tokens_de(raw: str) -> list:
+    """
+    Delimiter-aware tokenization + normalization for German keywords.
+    
+    BUSINESS RULE: "KGS" (Kappsäge abbreviation) must NOT collapse to "kg".
+    
+    Option 1 implementation:
+    - Split delimiters (hyphen, slash, comma, space) -> segments become separate tokens
+    - Preserve original normalized token (lowercased + German2 only, no stem if contains delimiter/digit)
+    - Apply stemming only to "word-like" segments (no uppercase abbreviations, no digits)
+    
+    Returns: list of normalized tokens (order: full, segments...)
+    
+    Examples:
+        "akku-KGS" -> ["akku-kgs", "akku", "kgs"]  (KGS protected from stemming)
+        "Hand-Kreissäge, Bohrmaschine" -> ["hand-kreissag", "hand", "kreissag", "bohrmaschi"]
+        "Akku" -> ["akku"]  (double 'k' preserved by CISTEM)
+        "abc-123s" -> ["abc-123s", "abc", "123s"]  (full token not stemmed due to digit)
+    """
+    if raw is None:
+        return []
+    
+    raw_str = str(raw).strip()
+    if not raw_str:
+        return []
+    
+    # Unicode normalize (NFKC) and preserve original for abbreviation detection
+    raw_nfkc = unicodedata.normalize("NFKC", raw_str)
+    original_raw_upper = raw_nfkc  # Keep pre-casefold for abbreviation check
+    
+    # Build "full token" (lowercased + German2, conditionally stemmed)
+    full_token = raw_nfkc.casefold()
+    full_token = _german2_normalize(full_token)
+    
+    # Check if full token contains delimiters or digits
+    has_delimiter = bool(re.search(r'[-,/\s]', full_token))
+    has_digit = bool(re.search(r'\d', full_token))
+    
+    # Stem full token ONLY if it has no delimiters and no digits
+    if not has_delimiter and not has_digit:
+        full_token = _cistem_stem(full_token)
+    
+    full_token = full_token.strip()
+    if not full_token:
+        return []
+    
+    result_tokens = [full_token]
+    
+    # Split into segments on delimiters
+    segments = re.split(r'[-,/\s]+', raw_nfkc)
+    segments = [s.strip() for s in segments if s.strip()]
+    
+    if len(segments) > 1:
+        # Multiple segments: normalize each individually
+        for seg in segments:
+            seg_lower = seg.casefold()
+            seg_lower = _german2_normalize(seg_lower)
+            
+            # Check if segment is an abbreviation (original was uppercase, len <= 4, no digits)
+            seg_is_abbrev = (
+                len(seg) <= 4
+                and seg.isupper()
+                and not re.search(r'\d', seg)
+            )
+            
+            # Stem segment ONLY if it's word-like (not abbreviation, no digits)
+            has_digit_seg = bool(re.search(r'\d', seg_lower))
+            if not seg_is_abbrev and not has_digit_seg:
+                seg_lower = _cistem_stem(seg_lower)
+            
+            seg_lower = seg_lower.strip()
+            if seg_lower and seg_lower != full_token:
+                result_tokens.append(seg_lower)
+    
+    return result_tokens
+
+
+def _maybe_run_normalization_selftest_from_env():
+    """
+    If environment variable KEYWORD_NORM_SELFTEST=1, run acceptance tests and exit.
+    This allows validating the normalization logic without deploying to Glue.
+    """
+    import os
+    if os.environ.get("KEYWORD_NORM_SELFTEST") != "1":
+        return
+    
+    print("=" * 60)
+    print("KEYWORD NORMALIZATION SELF-TEST")
+    print("=" * 60)
+    
+    test_cases = [
+        ("akku-KGS", ["akku-kgs", "akku", "kgs"], "Hyphen split + abbreviation protection"),
+        ("KGS", ["kgs"], "Abbreviation protection (uppercase)"),
+        ("Akku", ["akku"], "Double consonant preserved"),
+        ("Schlüssel", None, "Umlaut normalization (must overlap with 'Schluessel')"),
+        ("abc-123s", ["abc-123s", "abc", "123s"], "Delimiter+digit: no stem on full token"),
+        ("Hand-Kreissäge, Bohrmaschine", None, "Complex compound"),
+    ]
+    
+    failures = []
+    for i, (input_kw, expected, description) in enumerate(test_cases, 1):
+        result = normalize_keyword_tokens_de(input_kw)
+        print(f"\nTest {i}: {description}")
+        print(f"  Input:    {repr(input_kw)}")
+        print(f"  Result:   {result}")
+        print(f"  Expected: {expected if expected else '(check manually)'}")
+        
+        if expected is not None:
+            # Exact match check
+            if set(result) != set(expected):
+                failures.append((i, input_kw, expected, result))
+                print(f"  ❌ FAILED")
+            else:
+                print(f"  ✅ PASSED")
+        else:
+            # Manual check
+            print(f"  ℹ️  MANUAL CHECK")
+    
+    # Special overlap check for Schlüssel/Schluessel
+    tokens_umlaut = set(normalize_keyword_tokens_de("Schlüssel"))
+    tokens_ascii = set(normalize_keyword_tokens_de("Schluessel"))
+    print(f"\n Special check: Schlüssel/Schluessel overlap")
+    print(f"  'Schlüssel' -> {tokens_umlaut}")
+    print(f"  'Schluessel' -> {tokens_ascii}")
+    print(f"  Overlap: {tokens_umlaut & tokens_ascii}")
+    if not (tokens_umlaut & tokens_ascii):
+        failures.append(("umlaut", "Schlüssel/Schluessel", "overlap", "no overlap"))
+        print(f"  ❌ FAILED")
+    else:
+        print(f"  ✅ PASSED")
+    
+    print("\n" + "=" * 60)
+    if failures:
+        print(f"❌ {len(failures)} TEST(S) FAILED:")
+        for fail in failures:
+            print(f"  {fail}")
+        print("=" * 60)
+        sys.exit(1)
+    else:
+        print("✅ ALL TESTS PASSED")
+        print("=" * 60)
+        sys.exit(0)
 
 
 def main():
@@ -733,6 +977,20 @@ def main():
         else:
             print("DEBUG: STEP C – training_records is empty list")
 
+        # Persist the filtered training subset for downstream jobs
+        current_step = "STEP C: Write training subset"
+        log_info(logger, current_step)
+        print(
+            "DEBUG: STEP C – writing training subset to S3 at: "
+            f"s3://{input_bucket}/{stable_training_key}"
+        )
+        training_body = json.dumps(training_records, indent=2, ensure_ascii=False)
+        s3_client.put_object(
+            Bucket=input_bucket,
+            Key=stable_training_key,
+            Body=training_body.encode("utf-8"),
+        )
+
         # =========================================================
         # STEP D: Prepare training subset for KEYWORD statistics
         # =========================================================
@@ -866,12 +1124,12 @@ def main():
                     for kw in raw_keywords:
                         if kw is None:
                             continue
-                        kw_str = str(kw).strip()
-                        if not kw_str:
+                        kw_normalized = normalize_keyword_de(kw)
+                        if kw_normalized is None:
                             continue
                         prev_kw_rows.append({
                             "pim_category_id": str(pim_category_id) if pim_category_id is not None else None,
-                            "keyword": kw_str,
+                            "keyword": kw_normalized,
                         })
 
                 if prev_kw_rows:
@@ -989,20 +1247,18 @@ def main():
                     for kw in kws:
                         if kw is None:
                             continue
-                        kw_str = str(kw).strip()
-                        if not kw_str:
-                            continue
-                        vendor_kw_rows.append(
-                            {
-                                "pim_category_id": str(pim_category_id)
-                                if pim_category_id is not None
-                                else None,
-                                "article_id": str(article_id)
-                                if article_id is not None
-                                else None,
-                                "keyword": kw_str,
-                            }
-                        )
+                        for tok in normalize_keyword_tokens_de(kw):
+                            vendor_kw_rows.append(
+                                {
+                                    "pim_category_id": str(pim_category_id)
+                                    if pim_category_id is not None
+                                    else None,
+                                    "article_id": str(article_id)
+                                    if article_id is not None
+                                    else None,
+                                    "keyword": tok,
+                                }
+                            )
 
         if vendor_kw_rows:
             df_kw_vendor = glue_context.spark_session.createDataFrame(
@@ -1268,23 +1524,40 @@ def main():
         log_info(logger, current_step)
         print("DEBUG: STEP K2 – starting K2 rule generation")
 
+        def _is_meaningful_token(tok: str) -> bool:
+            if not tok:
+                return False
+            # require length >= 4
+            if len(tok) < 4:
+                return False
+            # require at least one letter (Unicode-aware)
+            if not any(ch.isalpha() for ch in tok):
+                return False
+            # reject pure-digit tokens
+            if re.fullmatch(r'[0-9]+', tok):
+                return False
+            # reject digit-only tokens with separators (likely article numbers)
+            if re.fullmatch(r'[0-9\.\-_/]+', tok):
+                return False
+            return True
+
         # Step 1: Build training_kw_occurrences (case-insensitive)
         training_kw_occurrences = {}
         for rec in training_records:
             pim_category_id_raw = rec.get("pim_category_id")
             # Normalize pim_category_id to string for consistent comparisons
             pim_category_id = str(pim_category_id_raw) if pim_category_id_raw is not None else None
-            raw_keywords = rec.get("keywords") or []
+            raw_keywords = rec.get("keywords_norm") or []
             if not isinstance(raw_keywords, list):
                 continue
-            # Build lowercased set of keywords for this record
+            # Build normalized set of keywords for this record (already normalized)
             keywords_set_lower = set()
             for kw in raw_keywords:
                 if kw is None:
                     continue
-                kw_lower = str(kw).strip().lower()
-                if kw_lower:
-                    keywords_set_lower.add(kw_lower)
+                kw_normalized = str(kw).strip()
+                if kw_normalized:
+                    keywords_set_lower.add(kw_normalized)
             
             if not keywords_set_lower:
                 continue
@@ -1328,14 +1601,11 @@ def main():
                     else:
                         kws = [raw_keywords]
 
-                    # Build lowercased set of keywords for this product
+                    # Build tokenized and normalized set of keywords for this product
                     keywords_set_lower = set()
                     for kw in kws:
-                        if kw is None:
-                            continue
-                        kw_lower = str(kw).strip().lower()
-                        if kw_lower:
-                            keywords_set_lower.add(kw_lower)
+                        for tok in normalize_keyword_tokens_de(kw):
+                            keywords_set_lower.add(tok)
                     
                     if not keywords_set_lower:
                         continue
@@ -1367,10 +1637,12 @@ def main():
                     str(pim_category_id) if pim_category_id is not None else None
                 )
                 keyword = r["keyword"]
-                keyword_lower = keyword.strip().lower()
+                keyword_normalized = str(keyword).strip() if keyword is not None else None
+                if not keyword_normalized:
+                    continue
 
-                # Get occurrences for this keyword
-                occ_list = training_kw_occurrences.get(keyword_lower, [])
+                # Get occurrences for this keyword (already normalized in df_stats)
+                occ_list = training_kw_occurrences.get(keyword_normalized, [])
                 if not occ_list:
                     continue
 
@@ -1397,8 +1669,10 @@ def main():
 
                 # Compute exclude_candidates (only tokens appearing outside but not inside)
                 exclude_candidates_raw = outside_tokens - inside_tokens
+                # lexical filter: keep only meaningful tokens (letters, len>=4, not numeric codes)
+                exclude_candidates_raw = {tok for tok in exclude_candidates_raw if _is_meaningful_token(tok)}
                 if not exclude_candidates_raw:
-                    # Skip if no exclude candidates exist (keyword only appears inside target category)
+                    # nothing meaningful to exclude -> skip K2 candidate
                     continue
 
                 # Apply MIN_K2_EXCLUDE_SUPPORT: filter exclude candidates by support count
@@ -1441,7 +1715,7 @@ def main():
                     continue
 
                 # Compute vendor stats under K2 semantics
-                vendor_occ_list = vendor_kw_occurrences.get(keyword_lower, [])
+                vendor_occ_list = vendor_kw_occurrences.get(keyword_normalized, [])
                 vendor_total_k2 = 0
                 vendor_inside_k2 = 0
                 vendor_outside_k2 = 0
@@ -1482,7 +1756,7 @@ def main():
                     "pim_category_name": pim_category_name,
                     "field_name": "KEYWORD",
                     "operator": "contains_any_exclude_any",
-                    "values_include": [keyword.strip()],
+                    "values_include": [keyword_normalized],
                     "values_exclude": sorted(list(exclude_candidates)),
                     "stats": {
                         "inside_count": inside_count,
@@ -1501,7 +1775,7 @@ def main():
                 log_info(
                     logger,
                     f"STEP K2: Accepted K2 rule - category={pim_category_id}, "
-                    f"keyword={keyword}, exclude_count={len(exclude_candidates)}, "
+                    f"keyword={keyword_normalized}, exclude_count={len(exclude_candidates)}, "
                     f"vendor_status={vendor_status_k2}"
                 )
 
@@ -2033,4 +2307,5 @@ def main():
 
 
 if __name__ == "__main__":
+    _maybe_run_normalization_selftest_from_env()
     main()
