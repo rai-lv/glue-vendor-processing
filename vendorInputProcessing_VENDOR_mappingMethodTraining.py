@@ -150,18 +150,23 @@ def normalize_training_record(rec: dict) -> dict:
     raw_keywords = out.get("keywords")
     if raw_keywords is None:
         keywords = []
+        keywords_norm = []
     elif isinstance(raw_keywords, list):
         keywords = []
+        keywords_norm = []
         for k in raw_keywords:
             if k is None:
                 continue
             kw_norm = normalize_keyword_de(k)
             if kw_norm is not None:
                 keywords.append(kw_norm)
+                keywords_norm.append(kw_norm)
     else:
         kw_norm = normalize_keyword_de(raw_keywords)
         keywords = [kw_norm] if kw_norm is not None else []
+        keywords_norm = [kw_norm] if kw_norm is not None else []
     out["keywords"] = keywords
+    out["keywords_norm"] = keywords_norm
 
     # Normalise class_codes: always a list of {system, code}
     raw_class_codes = out.get("class_codes")
@@ -296,6 +301,42 @@ def normalize_keyword_de(keyword: str) -> str | None:
     token = token.strip()
 
     return token or None
+
+
+def normalize_keyword_tokens_de(keyword):
+    """
+    Tokenize and normalize a keyword that may contain multiple tokens.
+    
+    Splits on common separators (space, comma, slash, hyphen when surrounded by spaces)
+    and normalizes each token independently using normalize_keyword_de().
+    
+    Returns a list of normalized tokens.
+    
+    Example:
+        "Hand-Kreissäge, Bohrmaschine" -> ["handkreissag", "bohrmaschi"]
+    """
+    if keyword is None:
+        return []
+    
+    keyword_str = str(keyword).strip()
+    if not keyword_str:
+        return []
+    
+    # Split on common separators: space, comma, forward slash
+    # Keep hyphen-connected words together (e.g., "akku-bohrmaschine")
+    import re
+    # Replace separators with space, then split
+    keyword_str = re.sub(r'[,/]+', ' ', keyword_str)
+    # Split on whitespace
+    tokens = keyword_str.split()
+    
+    normalized_tokens = []
+    for tok in tokens:
+        tok_normalized = normalize_keyword_de(tok)
+        if tok_normalized is not None:
+            normalized_tokens.append(tok_normalized)
+    
+    return normalized_tokens
 
 
 def main():
@@ -1098,20 +1139,18 @@ def main():
                     for kw in kws:
                         if kw is None:
                             continue
-                        kw_str = str(kw).strip()
-                        if not kw_str:
-                            continue
-                        vendor_kw_rows.append(
-                            {
-                                "pim_category_id": str(pim_category_id)
-                                if pim_category_id is not None
-                                else None,
-                                "article_id": str(article_id)
-                                if article_id is not None
-                                else None,
-                                "keyword": kw_str,
-                            }
-                        )
+                        for tok in normalize_keyword_tokens_de(kw):
+                            vendor_kw_rows.append(
+                                {
+                                    "pim_category_id": str(pim_category_id)
+                                    if pim_category_id is not None
+                                    else None,
+                                    "article_id": str(article_id)
+                                    if article_id is not None
+                                    else None,
+                                    "keyword": tok,
+                                }
+                            )
 
         if vendor_kw_rows:
             df_kw_vendor = glue_context.spark_session.createDataFrame(
@@ -1400,14 +1439,16 @@ def main():
             pim_category_id_raw = rec.get("pim_category_id")
             # Normalize pim_category_id to string for consistent comparisons
             pim_category_id = str(pim_category_id_raw) if pim_category_id_raw is not None else None
-            raw_keywords = rec.get("keywords") or []
+            raw_keywords = rec.get("keywords_norm") or []
             if not isinstance(raw_keywords, list):
                 continue
-            # Build lowercased and normalized set of keywords for this record
+            # Build normalized set of keywords for this record (already normalized)
             keywords_set_lower = set()
             for kw in raw_keywords:
-                kw_normalized = normalize_keyword_de(kw)
-                if kw_normalized is not None:
+                if kw is None:
+                    continue
+                kw_normalized = str(kw).strip()
+                if kw_normalized:
                     keywords_set_lower.add(kw_normalized)
             
             if not keywords_set_lower:
@@ -1452,12 +1493,11 @@ def main():
                     else:
                         kws = [raw_keywords]
 
-                    # Build lowercased and normalized set of keywords for this product
+                    # Build tokenized and normalized set of keywords for this product
                     keywords_set_lower = set()
                     for kw in kws:
-                        kw_normalized = normalize_keyword_de(kw)
-                        if kw_normalized is not None:
-                            keywords_set_lower.add(kw_normalized)
+                        for tok in normalize_keyword_tokens_de(kw):
+                            keywords_set_lower.add(tok)
                     
                     if not keywords_set_lower:
                         continue
@@ -1489,11 +1529,11 @@ def main():
                     str(pim_category_id) if pim_category_id is not None else None
                 )
                 keyword = r["keyword"]
-                keyword_normalized = normalize_keyword_de(keyword)
-                if keyword_normalized is None:
+                keyword_normalized = str(keyword).strip() if keyword is not None else None
+                if not keyword_normalized:
                     continue
 
-                # Get occurrences for this keyword
+                # Get occurrences for this keyword (already normalized in df_stats)
                 occ_list = training_kw_occurrences.get(keyword_normalized, [])
                 if not occ_list:
                     continue
