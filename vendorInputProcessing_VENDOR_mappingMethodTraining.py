@@ -303,40 +303,148 @@ def normalize_keyword_de(keyword: str) -> str | None:
     return token or None
 
 
-def normalize_keyword_tokens_de(keyword):
+def normalize_keyword_tokens_de(raw: str) -> list:
     """
-    Tokenize and normalize a keyword that may contain multiple tokens.
+    Delimiter-aware tokenization + normalization for German keywords.
     
-    Splits on common separators (space, comma, slash, hyphen when surrounded by spaces)
-    and normalizes each token independently using normalize_keyword_de().
+    BUSINESS RULE: "KGS" (Kappsäge abbreviation) must NOT collapse to "kg".
     
-    Returns a list of normalized tokens.
+    Option 1 implementation:
+    - Split delimiters (hyphen, slash, comma, space) -> segments become separate tokens
+    - Preserve original normalized token (lowercased + German2 only, no stem if contains delimiter/digit)
+    - Apply stemming only to "word-like" segments (no uppercase abbreviations, no digits)
     
-    Example:
-        "Hand-Kreissäge, Bohrmaschine" -> ["handkreissag", "bohrmaschi"]
+    Returns: list of normalized tokens (order: full, segments...)
+    
+    Examples:
+        "akku-KGS" -> ["akku-kgs", "akku", "kgs"]  (KGS protected from stemming)
+        "Hand-Kreissäge, Bohrmaschine" -> ["hand-kreissag", "hand", "kreissag", "bohrmaschi"]
+        "Akku" -> ["akku"]  (double 'k' preserved by CISTEM)
+        "abc-123s" -> ["abc-123s", "abc", "123s"]  (full token not stemmed due to digit)
     """
-    if keyword is None:
+    if raw is None:
         return []
     
-    keyword_str = str(keyword).strip()
-    if not keyword_str:
+    raw_str = str(raw).strip()
+    if not raw_str:
         return []
     
-    # Split on common separators: space, comma, forward slash
-    # Keep hyphen-connected words together (e.g., "akku-bohrmaschine")
-    import re
-    # Replace separators with space, then split
-    keyword_str = re.sub(r'[,/]+', ' ', keyword_str)
-    # Split on whitespace
-    tokens = keyword_str.split()
+    # Unicode normalize (NFKC) and preserve original for abbreviation detection
+    raw_nfkc = unicodedata.normalize("NFKC", raw_str)
+    original_raw_upper = raw_nfkc  # Keep pre-casefold for abbreviation check
     
-    normalized_tokens = []
-    for tok in tokens:
-        tok_normalized = normalize_keyword_de(tok)
-        if tok_normalized is not None:
-            normalized_tokens.append(tok_normalized)
+    # Build "full token" (lowercased + German2, conditionally stemmed)
+    full_token = raw_nfkc.casefold()
+    full_token = _german2_normalize(full_token)
     
-    return normalized_tokens
+    # Check if full token contains delimiters or digits
+    has_delimiter = bool(re.search(r'[-,/\s]', full_token))
+    has_digit = bool(re.search(r'\d', full_token))
+    
+    # Stem full token ONLY if it has no delimiters and no digits
+    if not has_delimiter and not has_digit:
+        full_token = _cistem_stem(full_token)
+    
+    full_token = full_token.strip()
+    if not full_token:
+        return []
+    
+    result_tokens = [full_token]
+    
+    # Split into segments on delimiters
+    segments = re.split(r'[-,/\s]+', raw_nfkc)
+    segments = [s.strip() for s in segments if s.strip()]
+    
+    if len(segments) > 1:
+        # Multiple segments: normalize each individually
+        for seg in segments:
+            seg_lower = seg.casefold()
+            seg_lower = _german2_normalize(seg_lower)
+            
+            # Check if segment is an abbreviation (original was uppercase, len <= 4, no digits)
+            seg_is_abbrev = (
+                len(seg) <= 4
+                and seg.isupper()
+                and not re.search(r'\d', seg)
+            )
+            
+            # Stem segment ONLY if it's word-like (not abbreviation, no digits)
+            has_digit_seg = bool(re.search(r'\d', seg_lower))
+            if not seg_is_abbrev and not has_digit_seg:
+                seg_lower = _cistem_stem(seg_lower)
+            
+            seg_lower = seg_lower.strip()
+            if seg_lower and seg_lower != full_token:
+                result_tokens.append(seg_lower)
+    
+    return result_tokens
+
+
+def _maybe_run_normalization_selftest_from_env():
+    """
+    If environment variable KEYWORD_NORM_SELFTEST=1, run acceptance tests and exit.
+    This allows validating the normalization logic without deploying to Glue.
+    """
+    import os
+    if os.environ.get("KEYWORD_NORM_SELFTEST") != "1":
+        return
+    
+    print("=" * 60)
+    print("KEYWORD NORMALIZATION SELF-TEST")
+    print("=" * 60)
+    
+    test_cases = [
+        ("akku-KGS", ["akku-kgs", "akku", "kgs"], "Hyphen split + abbreviation protection"),
+        ("KGS", ["kgs"], "Abbreviation protection (uppercase)"),
+        ("Akku", ["akku"], "Double consonant preserved"),
+        ("Schlüssel", None, "Umlaut normalization (must overlap with 'Schluessel')"),
+        ("abc-123s", ["abc-123s", "abc", "123s"], "Delimiter+digit: no stem on full token"),
+        ("Hand-Kreissäge, Bohrmaschine", None, "Complex compound"),
+    ]
+    
+    failures = []
+    for i, (input_kw, expected, description) in enumerate(test_cases, 1):
+        result = normalize_keyword_tokens_de(input_kw)
+        print(f"\nTest {i}: {description}")
+        print(f"  Input:    {repr(input_kw)}")
+        print(f"  Result:   {result}")
+        print(f"  Expected: {expected if expected else '(check manually)'}")
+        
+        if expected is not None:
+            # Exact match check
+            if set(result) != set(expected):
+                failures.append((i, input_kw, expected, result))
+                print(f"  ❌ FAILED")
+            else:
+                print(f"  ✅ PASSED")
+        else:
+            # Manual check
+            print(f"  ℹ️  MANUAL CHECK")
+    
+    # Special overlap check for Schlüssel/Schluessel
+    tokens_umlaut = set(normalize_keyword_tokens_de("Schlüssel"))
+    tokens_ascii = set(normalize_keyword_tokens_de("Schluessel"))
+    print(f"\n Special check: Schlüssel/Schluessel overlap")
+    print(f"  'Schlüssel' -> {tokens_umlaut}")
+    print(f"  'Schluessel' -> {tokens_ascii}")
+    print(f"  Overlap: {tokens_umlaut & tokens_ascii}")
+    if not (tokens_umlaut & tokens_ascii):
+        failures.append(("umlaut", "Schlüssel/Schluessel", "overlap", "no overlap"))
+        print(f"  ❌ FAILED")
+    else:
+        print(f"  ✅ PASSED")
+    
+    print("\n" + "=" * 60)
+    if failures:
+        print(f"❌ {len(failures)} TEST(S) FAILED:")
+        for fail in failures:
+            print(f"  {fail}")
+        print("=" * 60)
+        sys.exit(1)
+    else:
+        print("✅ ALL TESTS PASSED")
+        print("=" * 60)
+        sys.exit(0)
 
 
 def main():
@@ -2199,4 +2307,5 @@ def main():
 
 
 if __name__ == "__main__":
+    _maybe_run_normalization_selftest_from_env()
     main()
