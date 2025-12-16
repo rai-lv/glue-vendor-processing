@@ -249,8 +249,8 @@ def _cistem_stem(token: str) -> str:
     for old, new in substitutions:
         word = word.replace(old, new)
 
-    # Handle double letters
-    word = re.sub(r"([bdfghklmnrt])\1", r"\1", word)
+    # Handle double letters (mark and later restore)
+    word = re.sub(r"([bdfghklmnrt])\1", r"\1*", word)
 
     # Remove circumfix / prefix
     if word.startswith("ge") and len(word) > 4:
@@ -267,6 +267,9 @@ def _cistem_stem(token: str) -> str:
     # Restore substitutions
     for old, new in reversed(substitutions):
         word = word.replace(new, old)
+
+    # Restore marked double letters
+    word = re.sub(r"([bdfghklmnrt])\*", r"\1\1", word)
 
     return word
 
